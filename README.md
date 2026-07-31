@@ -25,6 +25,21 @@ The terrain is a single mesh that follows the camera and re-reads its heights
 from a tiling heightfield, so the world reads as unbounded at a fixed vertex
 cost.
 
+## The look
+
+Wireframe on a `#f2ecdf` paper ground: the terrain is the ink, and the fog
+dissolves it back into the page at distance rather than fading it to a horizon.
+
+Because of that inversion, both ramp colours sit in a narrow dark band and the
+lights are pulled well down — at the earlier intensities the lit faces washed
+out toward the background instead of reading as marks on it. If you raise
+`colorHigh` toward white, drop the light intensities to match or the peaks will
+disappear into the paper.
+
+Setting `:wireframe="false"` gives a solid ink-wash version of the same palette,
+which is worth a look — the fog does something quite different with mass than it
+does with lines.
+
 ## What actually moves into the main project
 
 | File | Purpose |
@@ -62,15 +77,17 @@ The component fills its parent, so give the parent a height.
 | `amplitude` | `130` | Peak terrain height |
 | `seed` | `1337` | Changing it generates a different world |
 | `ridge` | `0.55` | How sharply ridges crease, `0`–`1` |
-| `colorLow` / `colorHigh` | | Height ramp endpoints. Keep these muted — lighting supplies the brightness |
-| `colorFog` / `colorSky` | | Keep these equal so the horizon stays seamless |
-| `wireframe` | `false` | Reactive |
+| `colorLow` / `colorHigh` | `#14232b` / `#55655e` | Height ramp endpoints |
+| `colorFog` / `colorSky` | `#f2ecdf` | Keep these equal so the horizon stays seamless |
+| `wireframe` | `true` | Reactive |
 | `steerOnHover` | `true` | `fly` only — steer by pointer position, no click needed |
 | `turnRate` | `34` | `fly` only — degrees per second at full steering input |
 | `lookSensitivity` | `140` | `free` only — degrees turned by a full drag across the viewport |
 | `scrollToMove` | `true` | `free` only — scroll moves forward and back. Swallows the wheel event |
 | `scrollSpeed` | `1` | Multiplier on how far one scroll notch pushes |
 | `invertScroll` | `false` | Flip which scroll direction travels forward |
+| `acceleration` | `16` | `free` only — how quickly movement reaches full speed. Higher is snappier |
+| `glide` | `1.6` | `free` only — how long movement coasts once input stops. **Lower** glides further |
 
 ### Events
 

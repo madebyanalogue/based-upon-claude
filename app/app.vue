@@ -4,7 +4,7 @@
  * judged in isolation — it is not intended to move into the main project.
  */
 const mode = ref<'free' | 'fly' | 'anchored'>('free')
-const wireframe = ref(false)
+const wireframe = ref(true)
 const seed = ref(1337)
 
 const readout = ref({ x: 0, z: 0, heading: 0, altitude: 0 })
@@ -75,7 +75,7 @@ body,
 #__nuxt {
   height: 100%;
   margin: 0;
-  background: #0d1418;
+  background: #f2ecdf;
 }
 
 body {
@@ -97,9 +97,9 @@ body {
   z-index: 2;
   padding: 1rem 1.25rem;
   min-width: 13rem;
-  color: #cfd8cf;
-  background: rgba(13, 20, 24, 0.72);
-  border: 1px solid rgba(207, 216, 207, 0.16);
+  color: #14232b;
+  background: rgba(242, 236, 223, 0.78);
+  border: 1px solid rgba(20, 35, 43, 0.18);
   border-radius: 0.5rem;
   backdrop-filter: blur(8px);
   font-size: 0.75rem;
@@ -127,20 +127,20 @@ button {
   color: inherit;
   font: inherit;
   font-size: 0.7rem;
-  background: rgba(207, 216, 207, 0.07);
-  border: 1px solid rgba(207, 216, 207, 0.18);
+  background: rgba(20, 35, 43, 0.05);
+  border: 1px solid rgba(20, 35, 43, 0.2);
   border-radius: 0.25rem;
   cursor: pointer;
 }
 
 button:hover {
-  background: rgba(207, 216, 207, 0.14);
+  background: rgba(20, 35, 43, 0.11);
 }
 
 button.on {
-  color: #0d1418;
-  background: #cfd8cf;
-  border-color: #cfd8cf;
+  color: #f2ecdf;
+  background: #14232b;
+  border-color: #14232b;
 }
 
 dl {

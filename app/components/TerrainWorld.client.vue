@@ -58,6 +58,17 @@ interface Props {
   scrollSpeed?: number
   /** Flip which scroll direction travels forward. */
   invertScroll?: boolean
+  /**
+   * `free` mode only: how quickly movement reaches full speed. Higher is
+   * snappier. This is deliberately much higher than `glide` — input should bite
+   * immediately, but momentum should take its time bleeding off.
+   */
+  acceleration?: number
+  /**
+   * `free` mode only: how long movement coasts once input stops. *Lower* values
+   * glide further. Shared by keys and scroll so both decelerate alike.
+   */
+  glide?: number
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -71,19 +82,22 @@ const props = withDefaults(defineProps<Props>(), {
   amplitude: 130,
   seed: 1337,
   ridge: 0.55,
-  // Kept deliberately muted — the lighting supplies the brightness, so a
-  // near-white albedo here would clip the lit faces to flat white.
-  colorLow: '#24333d',
-  colorHigh: '#9aa89f',
-  colorFog: '#0d1418',
-  colorSky: '#0d1418',
-  wireframe: false,
+  // Inverted scheme: the terrain is the ink and the background is the paper, so
+  // both ramp colours sit in a narrow dark band and the lighting is pulled well
+  // down to keep the lit faces from washing out toward the page.
+  colorLow: '#14232b',
+  colorHigh: '#55655e',
+  colorFog: '#f2ecdf',
+  colorSky: '#f2ecdf',
+  wireframe: true,
   steerOnHover: true,
   turnRate: 34,
   lookSensitivity: 140,
   scrollToMove: true,
   scrollSpeed: 1,
   invertScroll: false,
+  acceleration: 16,
+  glide: 1.6,
 })
 
 const emit = defineEmits<{
@@ -270,12 +284,18 @@ function updateCamera(dt: number) {
     const targetX = (forwardX * rig.moveForward + rightX * rig.moveStrafe) * props.speed
     const targetZ = (forwardZ * rig.moveForward + rightZ * rig.moveStrafe) * props.speed
 
-    rig.velocityX += (targetX - rig.velocityX) * smoothing(6, dt)
-    rig.velocityZ += (targetZ - rig.velocityZ) * smoothing(6, dt)
+    // Asymmetric response: accelerate hard while a key is held, then fall back
+    // to the much slower glide rate once it is released. Using one rate for
+    // both would force a choice between feeling sluggish and stopping dead.
+    const holding = rig.moveForward !== 0 || rig.moveStrafe !== 0
+    const rate = holding ? props.acceleration : props.glide
+
+    rig.velocityX += (targetX - rig.velocityX) * smoothing(rate, dt)
+    rig.velocityZ += (targetZ - rig.velocityZ) * smoothing(rate, dt)
 
     // Each scroll is a push that coasts to a stop rather than a fixed step, so
     // a flick of the wheel glides instead of teleporting.
-    rig.scrollVelocity *= Math.exp(-3.2 * dt)
+    rig.scrollVelocity *= Math.exp(-props.glide * dt)
     if (Math.abs(rig.scrollVelocity) < 0.05) rig.scrollVelocity = 0
 
     rig.x += (rig.velocityX + forwardX * rig.scrollVelocity) * dt
@@ -391,11 +411,12 @@ function onWheel(event: WheelEvent) {
   const pixels = Math.max(-120, Math.min(120, event.deltaY * unit))
 
   const direction = props.invertScroll ? -1 : 1
-  rig.scrollVelocity += pixels * 0.055 * props.scrollSpeed * direction
+  rig.scrollVelocity += pixels * 0.18 * props.scrollSpeed * direction
 
   // Keep the accumulated push within reach of the walking speed so repeated
-  // fast scrolling cannot build up unbounded velocity.
-  const limit = props.speed * 3
+  // fast scrolling cannot build up unbounded velocity. The ceiling is generous
+  // because the glide, not the cap, is what should limit how far a flick goes.
+  const limit = props.speed * 3.5
   rig.scrollVelocity = Math.max(-limit, Math.min(limit, rig.scrollVelocity))
 }
 
@@ -484,11 +505,11 @@ function init() {
   mesh.frustumCulled = false
   scene.add(mesh)
 
-  scene.add(new THREE.HemisphereLight(0x93a7b3, 0x10161a, 0.85))
+  scene.add(new THREE.HemisphereLight(0x93a7b3, 0x10161a, 0.35))
   // A single sun gives the ridges a long lit face and a deep shaded one, which
   // is what separates them from each other at distance. Kept above 45° so that
   // flat lowland still catches enough light to read when the seed lands there.
-  const sun = new THREE.DirectionalLight(0xffe4c4, 2)
+  const sun = new THREE.DirectionalLight(0xffe4c4, 0.8)
   sun.position.set(-0.6, 0.75, 0.45)
   scene.add(sun)
 
@@ -613,7 +634,7 @@ watch(
   place-content: center;
   padding: 2rem;
   text-align: center;
-  color: #cfd8cf;
-  background: #0d1418;
+  color: #14232b;
+  background: #f2ecdf;
 }
 </style>
