@@ -56,9 +56,9 @@ function reseed() {
       </dl>
 
       <p v-if="mode === 'free'" class="hint">
-        Drag to look around.
+        Scroll to go forward and back · drag to look around.
         <br />W / S forward and back · A / D sideways
-        <br />R / F altitude · nothing moves unless you hold a key
+        <br />R / F altitude · nothing moves on its own
       </p>
       <p v-else-if="mode === 'fly'" class="hint">
         Moves forward on its own. Pointer left or right steers.

@@ -68,6 +68,9 @@ The component fills its parent, so give the parent a height.
 | `steerOnHover` | `true` | `fly` only — steer by pointer position, no click needed |
 | `turnRate` | `34` | `fly` only — degrees per second at full steering input |
 | `lookSensitivity` | `140` | `free` only — degrees turned by a full drag across the viewport |
+| `scrollToMove` | `true` | `free` only — scroll moves forward and back. Swallows the wheel event |
+| `scrollSpeed` | `1` | Multiplier on how far one scroll notch pushes |
+| `invertScroll` | `false` | Flip which scroll direction travels forward |
 
 ### Events
 
@@ -83,14 +86,23 @@ are looking.
 
 | Input | Action |
 | --- | --- |
+| Scroll | Forward and back |
+| Drag | Look around |
 | `W` / `S` or `↑` / `↓` | Forward and back |
 | `A` / `D` or `←` / `→` | Sideways (strafe) |
-| Drag | Look around |
 | `R` / `F` | Raise / lower the held altitude |
 
+Scroll and drag alone are enough to explore, so the keyboard is optional.
+
 Velocity is eased rather than applied directly, so starting and stopping glides
-instead of snapping. Pitch is clamped short of vertical so the view cannot
-invert.
+instead of snapping. Each scroll is a push that coasts to a stop rather than a
+fixed step. Pitch is clamped short of vertical so the view cannot invert.
+
+**Scroll swallows the wheel event** over the viewport, so the page behind it
+cannot scroll while the pointer is inside. That is fine for a full-screen
+viewport, but set `:scroll-to-move="false"` if the component ever sits inside a
+scrolling page. Trackpad and mouse-wheel deltas are normalised and clamped, so
+trackpad momentum cannot fling the camera.
 
 ### `fly`
 

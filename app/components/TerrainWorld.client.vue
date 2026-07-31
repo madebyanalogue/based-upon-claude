@@ -46,6 +46,18 @@ interface Props {
   turnRate?: number
   /** `free` mode only: how far a full drag across the viewport turns the view, in degrees. */
   lookSensitivity?: number
+  /**
+   * `free` mode only: scroll wheel and trackpad move forward and back.
+   *
+   * This swallows the wheel event over the viewport, so the page behind it
+   * cannot be scrolled while the pointer is inside. Turn it off if the
+   * component sits inside a scrolling page.
+   */
+  scrollToMove?: boolean
+  /** Multiplier on how far one scroll notch pushes. */
+  scrollSpeed?: number
+  /** Flip which scroll direction travels forward. */
+  invertScroll?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -69,6 +81,9 @@ const props = withDefaults(defineProps<Props>(), {
   steerOnHover: true,
   turnRate: 34,
   lookSensitivity: 140,
+  scrollToMove: true,
+  scrollSpeed: 1,
+  invertScroll: false,
 })
 
 const emit = defineEmits<{
@@ -121,6 +136,8 @@ const rig = {
   moveStrafe: 0,
   velocityX: 0,
   velocityZ: 0,
+  /** Forward speed contributed by scrolling. Decays on its own between events. */
+  scrollVelocity: 0,
 }
 
 const keys = new Set<string>()
@@ -256,8 +273,13 @@ function updateCamera(dt: number) {
     rig.velocityX += (targetX - rig.velocityX) * smoothing(6, dt)
     rig.velocityZ += (targetZ - rig.velocityZ) * smoothing(6, dt)
 
-    rig.x += rig.velocityX * dt
-    rig.z += rig.velocityZ * dt
+    // Each scroll is a push that coasts to a stop rather than a fixed step, so
+    // a flick of the wheel glides instead of teleporting.
+    rig.scrollVelocity *= Math.exp(-3.2 * dt)
+    if (Math.abs(rig.scrollVelocity) < 0.05) rig.scrollVelocity = 0
+
+    rig.x += (rig.velocityX + forwardX * rig.scrollVelocity) * dt
+    rig.z += (rig.velocityZ + forwardZ * rig.scrollVelocity) * dt
   }
 
   if (props.mode === 'fly') {
@@ -355,6 +377,26 @@ function onPointerMove(event: PointerEvent) {
     magnitude < deadZone
       ? 0
       : Math.sign(normalised) * ((magnitude - deadZone) / (1 - deadZone))
+}
+
+function onWheel(event: WheelEvent) {
+  if (!props.scrollToMove || props.mode !== 'free') return
+  event.preventDefault()
+
+  // deltaY arrives in wildly different units depending on the device and the
+  // browser's deltaMode, so normalise to pixels first, then clamp — trackpad
+  // momentum can otherwise deliver a single enormous delta that flings the
+  // camera across the world.
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? window.innerHeight : 1
+  const pixels = Math.max(-120, Math.min(120, event.deltaY * unit))
+
+  const direction = props.invertScroll ? -1 : 1
+  rig.scrollVelocity += pixels * 0.055 * props.scrollSpeed * direction
+
+  // Keep the accumulated push within reach of the walking speed so repeated
+  // fast scrolling cannot build up unbounded velocity.
+  const limit = props.speed * 3
+  rig.scrollVelocity = Math.max(-limit, Math.min(limit, rig.scrollVelocity))
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -531,6 +573,7 @@ watch(
     @pointerdown="onPointerDown"
     @pointerup="onPointerUp"
     @pointerleave="onPointerLeave"
+    @wheel="onWheel"
   >
     <p v-if="failed" class="terrain-world__fallback">
       This view needs WebGL, which this browser has turned off or does not support.
