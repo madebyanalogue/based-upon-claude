@@ -33,13 +33,28 @@ const lat = Number(latArg)
 const lon = Number(lonArg)
 const km = Number(kmArg)
 
-// Zoom 12 gives ~38m per pixel at the equator — close to SRTM's native 30m
-// resolution, so higher zooms would only interpolate, not add detail.
-const ZOOM = 12
 const TILE = 256
+const latRad = (lat * Math.PI) / 180
+
+/**
+ * Pick the zoom that lands the window near TARGET_PX across.
+ *
+ * SRTM is natively 30m, so zooms past ~12 interpolate rather than reveal. For
+ * a close-range terrain that is still worth doing: the interpolated surface is
+ * smooth where the raw one is stair-stepped, and the detail a viewer actually
+ * sees at that range is synthesised on top regardless.
+ */
+// The window grows with zoom, so this keeps the *highest* zoom that still fits
+// inside the target rather than stopping at the first one that does.
+const TARGET_PX = 640
+let ZOOM = 10
+for (let z = 10; z <= 14; z++) {
+  const mpp = (156543.03392 * Math.cos(latRad)) / 2 ** z
+  if ((km * 1000) / mpp > TARGET_PX) break
+  ZOOM = z
+}
 
 const n = 2 ** ZOOM
-const latRad = (lat * Math.PI) / 180
 
 // Web-mercator tile coordinates of the centre point.
 const xTile = ((lon + 180) / 360) * n
@@ -60,7 +75,10 @@ const ty0 = Math.floor(py0 / TILE)
 const tx1 = Math.floor((px0 + size - 1) / TILE)
 const ty1 = Math.floor((py0 + size - 1) / TILE)
 
-console.log(`window ${size}x${size}px (${(size * metersPerPixel / 1000).toFixed(1)}km), tiles x ${tx0}..${tx1}, y ${ty0}..${ty1}`)
+console.log(
+  `zoom ${ZOOM} (${metersPerPixel.toFixed(1)}m/px), window ${size}x${size}px ` +
+    `(${((size * metersPerPixel) / 1000).toFixed(1)}km), tiles x ${tx0}..${tx1}, y ${ty0}..${ty1}`,
+)
 
 const cols = tx1 - tx0 + 1
 const rows = ty1 - ty0 + 1
@@ -172,20 +190,39 @@ async function fetchOsmFeatures() {
     `way[natural=wood](${bbox});way[landuse=forest](${bbox});` +
     `relation[natural=water](${bbox});relation[natural=wood](${bbox});relation[landuse=forest](${bbox});` +
     `);out geom;`
-  process.stdout.write('fetching OSM features ... ')
-  const res = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'terrain-bake-script/0.1 (dev tooling)',
-    },
-    body: 'data=' + encodeURIComponent(query),
-  })
-  if (!res.ok) throw new Error(`overpass -> HTTP ${res.status}`)
-  const text = await res.text()
-  await writeFile(cache, text)
-  console.log('ok')
-  return JSON.parse(text)
+  // Overpass is a shared free service and routinely 504s under load. Try the
+  // mirrors, with a pause between attempts, before giving up on features.
+  const endpoints = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter',
+  ]
+  let lastError = 'no attempt made'
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const url = endpoints[attempt % endpoints.length]
+    process.stdout.write(`fetching OSM features (${new URL(url).host}) ... `)
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'terrain-bake-script/0.1 (dev tooling)',
+        },
+        body: 'data=' + encodeURIComponent(query),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
+      if (text[0] !== '{') throw new Error('non-JSON response')
+      await writeFile(cache, text)
+      console.log('ok')
+      return JSON.parse(text)
+    } catch (error) {
+      lastError = error.message
+      console.log(`failed (${lastError})`)
+      await new Promise((resolve) => setTimeout(resolve, 4000))
+    }
+  }
+  throw new Error(`overpass unavailable: ${lastError}`)
 }
 
 /** Even-odd scanline fill of one ring ([lat,lon][]) into `mask` with `bit`. */

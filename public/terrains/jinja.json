@@ -1,14 +1,14 @@
 {
-  "title": "Jinja — Source of the Nile",
-  "lat": 0.54,
-  "lon": 33.115,
-  "sizeMeters": 27975,
-  "resolution": 732,
-  "minElevation": 1055.7,
-  "maxElevation": 1342,
+  "title": "Itanda Falls, Jinja",
+  "lat": 0.6002,
+  "lon": 33.0577,
+  "sizeMeters": 3994,
+  "resolution": 418,
+  "minElevation": 1062.3,
+  "maxElevation": 1123.9,
   "source": "Mapzen terrarium tiles on AWS (NASA SRTM)",
   "spot": {
-    "northMeters": 6679,
-    "eastMeters": -6790
+    "northMeters": 0,
+    "eastMeters": 0
   }
 }

@@ -94,3 +94,24 @@ export function fbm(u: number, v: number, opts: FbmOptions): number {
 
   return sum / totalAmplitude
 }
+
+/**
+ * Micro-relief for real-world terrain, in world units.
+ *
+ * A 30m DEM is smooth at every scale a viewer actually looks at from 70 units
+ * up, so measured ground reads as soft blobs. This adds the sub-sample texture
+ * that makes it look like ground rather than a surface. It tiles at `period`,
+ * which is invisible at these amplitudes.
+ */
+export function detail2D(x: number, z: number, seed: number, period = 720): number {
+  return (
+    fbm(x / period, z / period, {
+      baseCells: 12,
+      octaves: 3,
+      seed,
+      gain: 0.55,
+      ridge: 0.35,
+    }) -
+    0.5
+  )
+}

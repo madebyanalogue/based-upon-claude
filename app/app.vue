@@ -6,16 +6,33 @@
 const mode = ref<'free' | 'fly' | 'anchored'>('free')
 const wireframe = ref(true)
 const theme = ref<'light' | 'dark'>('light')
+const style = ref<'ink' | 'natural'>('ink')
 const seed = ref(1337)
 
-// Real places carry their own exaggeration: gentle landscapes need more of it
-// before their relief reads at all.
+// Jinja is baked at close range: one world unit is one metre, so the camera
+// altitude, tree heights and relief below are all real-world figures.
 const terrains = [
-  { label: 'Jinja', src: '/terrains/jinja', exaggeration: 5 },
-  { label: 'Procedural', src: '', exaggeration: 2.5 },
+  { label: 'Jinja', src: '/terrains/jinja', exaggeration: 1.8, metersPerUnit: 1 },
+  { label: 'Procedural', src: '', exaggeration: 2.5, metersPerUnit: 5 },
 ]
 const terrainSrc = ref(terrains[0]!.src)
 const currentTerrain = computed(() => terrains.find((t) => t.src === terrainSrc.value) ?? terrains[0]!)
+
+/**
+ * Close-range framing, in metres. Everything here is set against human scale:
+ * a viewer 26m up, a 420m horizon, mesh detail down to about 1.6m, and trees
+ * at the height Mabira's canopy actually reaches.
+ */
+const closeRange = {
+  altitude: 26,
+  pitch: -9,
+  gridSize: 760,
+  segments: 272,
+  speed: 15,
+  detailRelief: 7,
+  treeHeight: 17,
+  maxLookDown: 45,
+}
 const terrainTitle = ref('')
 
 function onTerrain(meta: { title: string }) {
@@ -48,13 +65,16 @@ function reseed() {
   <div class="stage" :class="`stage--${theme}`">
     <!-- Keying on terrain + seed forces a clean rebuild when the world changes. -->
     <TerrainWorld
-      :key="`${terrainSrc}|${seed}`"
+      :key="`${terrainSrc}|${seed}|${style}`"
       :mode="mode"
       :theme="theme"
+      :render-style="style"
       :wireframe="wireframe"
       :seed="seed"
       :src="terrainSrc"
       :exaggeration="currentTerrain.exaggeration"
+      :meters-per-unit="currentTerrain.metersPerUnit"
+      v-bind="terrainSrc && style === 'natural' ? closeRange : {}"
       @move="onMove"
       @terrain="onTerrain"
     />
@@ -80,8 +100,15 @@ function reseed() {
       </div>
 
       <div class="row">
-        <button :class="{ on: wireframe }" @click="wireframe = !wireframe">Wireframe</button>
-        <button @click="theme = theme === 'light' ? 'dark' : 'light'">
+        <button :class="{ on: style === 'ink' }" @click="style = 'ink'">Ink</button>
+        <button :class="{ on: style === 'natural' }" @click="style = 'natural'">Natural</button>
+      </div>
+
+      <div class="row">
+        <button v-if="style === 'ink'" :class="{ on: wireframe }" @click="wireframe = !wireframe">
+          Wireframe
+        </button>
+        <button v-if="style === 'ink'" @click="theme = theme === 'light' ? 'dark' : 'light'">
           {{ theme === 'light' ? 'Dark' : 'Light' }}
         </button>
         <button v-if="!terrainSrc" @click="reseed">Reseed</button>
