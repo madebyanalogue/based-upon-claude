@@ -2,13 +2,11 @@
   "title": "Itanda Falls, Jinja",
   "lat": 0.6002,
   "lon": 33.0577,
-  "sizeMeters": 3994,
-  "resolution": 418,
-  "minElevation": 1062.3,
-  "maxElevation": 1123.9,
-  "source": "Mapzen terrarium tiles on AWS (NASA SRTM)",
-  "spot": {
-    "northMeters": 0,
-    "eastMeters": 0
-  }
+  "sizeMeters": 554,
+  "resolution": 58,
+  "featureResolution": 1024,
+  "flowResolution": 256,
+  "minElevation": 1065.3,
+  "maxElevation": 1094.2,
+  "source": "Mapzen terrarium tiles on AWS (NASA SRTM)"
 }

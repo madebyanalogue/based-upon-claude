@@ -171,10 +171,22 @@ const north = lat + (halfPx * metersPerPixel) / 111320
 const west = lon - (halfPx * metersPerPixel) / (111320 * Math.cos(latRad))
 const east = lon + (halfPx * metersPerPixel) / (111320 * Math.cos(latRad))
 
-const toPixel = (plat, plon) => [
-  ((north - plat) / (north - south)) * size, // row
-  ((plon - west) / (east - west)) * size, // col
+/**
+ * Features are rasterised on their own grid, far finer than the DEM.
+ *
+ * OSM polygons are surveyed to a few metres, but rasterising them at the DEM's
+ * 9.6m spacing throws that away and leaves a staircase shoreline. At close
+ * range the bank is the thing you actually look at, so it gets a grid that can
+ * hold the precision the source already has.
+ */
+const featureSize = Math.min(1536, Math.max(size, 1024))
+const flowSize = Math.round(featureSize / 4)
+
+const toPixelOn = (grid) => (plat, plon) => [
+  ((north - plat) / (north - south)) * grid, // row
+  ((plon - west) / (east - west)) * grid, // col
 ]
+const toPixel = toPixelOn(featureSize)
 
 async function fetchOsmFeatures() {
   // A cache file makes re-bakes cheap while tuning; delete it to refetch.
@@ -183,7 +195,17 @@ async function fetchOsmFeatures() {
     console.log('using cached OSM response', cache)
     return JSON.parse(await readFile(cache, 'utf8'))
   }
-  const bbox = `${south.toFixed(4)},${west.toFixed(4)},${north.toFixed(4)},${east.toFixed(4)}`
+  // Query well outside the window. Overpass returns ways that have a node
+  // inside the box, and a small window sitting in the middle of a large river
+  // or forest polygon contains none of its nodes — asking for exactly the
+  // window returns nothing at all. The rasteriser clips to the window anyway.
+  const pad = Math.max(0.025, (north - south) * 4)
+  const bbox = [
+    (south - pad).toFixed(4),
+    (west - pad).toFixed(4),
+    (north + pad).toFixed(4),
+    (east + pad).toFixed(4),
+  ].join(',')
   const query =
     `[out:json][timeout:90];(` +
     `way[natural=water](${bbox});way[waterway=riverbank](${bbox});way[waterway=river](${bbox});` +
@@ -235,7 +257,7 @@ function fillRing(mask, ring, bit) {
     if (r > maxRow) maxRow = r
   }
   const r0 = Math.max(0, Math.floor(minRow))
-  const r1 = Math.min(size - 1, Math.ceil(maxRow))
+  const r1 = Math.min(featureSize - 1, Math.ceil(maxRow))
 
   for (let r = r0; r <= r1; r++) {
     const y = r + 0.5
@@ -249,8 +271,8 @@ function fillRing(mask, ring, bit) {
     crossings.sort((a, b) => a - b)
     for (let i = 0; i + 1 < crossings.length; i += 2) {
       const c0 = Math.max(0, Math.round(crossings[i]))
-      const c1 = Math.min(size - 1, Math.round(crossings[i + 1]))
-      for (let c = c0; c <= c1; c++) mask[r * size + c] |= bit
+      const c1 = Math.min(featureSize - 1, Math.round(crossings[i + 1]))
+      for (let c = c0; c <= c1; c++) mask[r * featureSize + c] |= bit
     }
   }
 }
@@ -270,7 +292,7 @@ function stampLine(mask, line, bit, radius) {
           if (dr * dr + dc * dc > radius * radius) continue
           const rr = Math.round(r + dr)
           const cc = Math.round(c + dc)
-          if (rr >= 0 && rr < size && cc >= 0 && cc < size) mask[rr * size + cc] |= bit
+          if (rr >= 0 && rr < featureSize && cc >= 0 && cc < featureSize) mask[rr * featureSize + cc] |= bit
         }
       }
     }
@@ -322,17 +344,20 @@ function assembleRings(members) {
 
 const WATER = 1
 const FOREST = 2
-const features = new Uint8Array(size * size)
+const features = new Uint8Array(featureSize * featureSize)
 
 // Per-cell flow direction, accumulated from river centrelines. OSM rivers are
 // drawn in downstream order by convention, which is far more reliable than
 // deriving flow from noisy radar water surfaces.
-const flowX = new Float32Array(size * size)
-const flowZ = new Float32Array(size * size)
+const flowX = new Float32Array(flowSize * flowSize)
+const flowZ = new Float32Array(flowSize * flowSize)
+const toFlowPixel = toPixelOn(flowSize)
 
 function stampFlow(line) {
-  const px = line.map(([plat, plon]) => toPixel(plat, plon))
-  const radius = 8
+  const px = line.map(([plat, plon]) => toFlowPixel(plat, plon))
+  // Flow varies over hundreds of metres, so it lives on a coarse grid; this
+  // reach is in flow cells, not feature cells.
+  const radius = 3
   for (let i = 0; i + 1 < px.length; i++) {
     const [ar, ac] = px[i]
     const [br, bc] = px[i + 1]
@@ -350,9 +375,9 @@ function stampFlow(line) {
           if (dr * dr + dc * dc > radius * radius) continue
           const rr = Math.round(r + dr)
           const cc = Math.round(c + dc)
-          if (rr < 0 || rr >= size || cc < 0 || cc >= size) continue
-          flowX[rr * size + cc] += dx
-          flowZ[rr * size + cc] += dz
+          if (rr < 0 || rr >= flowSize || cc < 0 || cc >= flowSize) continue
+          flowX[rr * flowSize + cc] += dx
+          flowZ[rr * flowSize + cc] += dz
         }
       }
     }
@@ -391,10 +416,10 @@ try {
     } else if (el.type === 'relation' && el.members) {
       const rings = assembleRings(el.members)
       // Erase inners by filling them into a scratch mask and subtracting.
-      const scratch = new Uint8Array(size * size)
+      const scratch = new Uint8Array(featureSize * featureSize)
       for (const ring of rings.outer) fillRing(scratch, ring, bit)
       for (const ring of rings.inner) {
-        const holes = new Uint8Array(size * size)
+        const holes = new Uint8Array(featureSize * featureSize)
         fillRing(holes, ring, bit)
         for (let i = 0; i < scratch.length; i++) if (holes[i]) scratch[i] = 0
       }
@@ -415,7 +440,8 @@ try {
     if (v & FOREST) forestCells++
   }
   console.log(
-    `features: ${waterWays} water polys + ${riverLines} river lines -> ${((waterCells / features.length) * 100).toFixed(1)}% water, ` +
+    `features @${featureSize}px (${((size * metersPerPixel) / featureSize).toFixed(2)}m/px): ` +
+      `${waterWays} water polys + ${riverLines} river lines -> ${((waterCells / features.length) * 100).toFixed(1)}% water, ` +
       `${forestWays} forest polys -> ${((forestCells / features.length) * 100).toFixed(1)}% forest`,
   )
 } catch (error) {
@@ -424,9 +450,8 @@ try {
 
 // Normalise accumulated flow and quantise to Int8 pairs. Cells without any
 // nearby centreline (the lake) stay zero — still water.
-const flow = new Int8Array(size * size * 2)
-for (let i = 0; i < size * size; i++) {
-  if (!(features[i] & WATER)) continue
+const flow = new Int8Array(flowSize * flowSize * 2)
+for (let i = 0; i < flowSize * flowSize; i++) {
   const length = Math.hypot(flowX[i], flowZ[i])
   if (length < 1e-6) continue
   flow[i * 2] = Math.round((flowX[i] / length) * 127)
@@ -446,6 +471,8 @@ await writeFile(
       lon,
       sizeMeters: Math.round(size * metersPerPixel),
       resolution: size,
+      featureResolution: featureSize,
+      flowResolution: flowSize,
       minElevation: Math.round(min * 10) / 10,
       maxElevation: Math.round(max * 10) / 10,
       source: 'Mapzen terrarium tiles on AWS (NASA SRTM)',

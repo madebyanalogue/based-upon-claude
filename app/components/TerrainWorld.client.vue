@@ -34,8 +34,10 @@ const NATURAL = {
   upland: '#6f7448',
   dry: '#8d8659',
   rock: '#6d6459',
-  /** Aerial perspective. Distant terrain dissolves into this, and so does the sky base. */
-  haze: '#c3d2dc',
+  // Haze and the sky's horizon band must be the *same* colour: terrain fades
+  // to one and the sky starts at the other, and any difference draws a visible
+  // line along the top of the mesh.
+  haze: '#cddbe6',
   skyHorizon: '#cddbe6',
   skyZenith: '#5b8cbe',
   water: '#2c4753',
@@ -127,6 +129,19 @@ interface Props {
   detailRelief?: number
   /** `natural` style only: typical mature tree height, in world units. */
   treeHeight?: number
+  /**
+   * Build the terrain once instead of streaming it under a moving camera.
+   *
+   * Streaming rebuilds the whole mesh every time the camera crosses a cell,
+   * which caps how fine the mesh can be and shows up as a hitch several times
+   * a second. A fixed scene pays that cost once at load, so the entire budget
+   * goes into detail. The camera is confined to `roamRadius` in return.
+   */
+  fixedScene?: boolean
+  /** `fixedScene` only: how far the camera may drift from the centre. */
+  roamRadius?: number
+  /** `natural` style only: typical boulder radius in the rapids, in world units. */
+  boulderSize?: number
   /** Picks the colour and lighting preset. Individual colours below override it. */
   theme?: Theme
   /**
@@ -203,6 +218,9 @@ const props = withDefaults(defineProps<Props>(), {
   metersPerUnit: 5,
   detailRelief: 1.8,
   treeHeight: 16,
+  fixedScene: false,
+  roamRadius: 45,
+  boulderSize: 2.6,
   // Colours are left undefined so they fall through to the theme preset; set
   // any of them to override just that one.
   theme: 'light',
@@ -293,6 +311,8 @@ let treeMesh: THREE.InstancedMesh | null = null
 let treeMaterial: THREE.Material | null = null
 let trunkMesh: THREE.InstancedMesh | null = null
 let trunkMaterial: THREE.Material | null = null
+let rockMesh: THREE.InstancedMesh | null = null
+let rockMaterial: THREE.Material | null = null
 let skyMesh: THREE.Mesh | null = null
 
 /** Upper bound on trees held in the instance buffers at once. */
@@ -361,6 +381,8 @@ const waterUniforms = {
   uStreak: { value: new THREE.Color('#31434d') },
   uDeep: { value: new THREE.Color(NATURAL.waterDeep) },
   uSun: { value: new THREE.Vector3(-0.6, 0.75, 0.45) },
+  /** Wave height at full turbulence, in world units. */
+  uWave: { value: 0.85 },
 }
 
 let frameHandle = 0
@@ -550,12 +572,24 @@ function buildTerrain(originX: number, originZ: number) {
  * OSM centrelines. Trees are one InstancedMesh scattered through the forest
  * cells — ink strokes in the drawing, canopy masses in the natural style.
  */
-function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemHeightfield) {
+function buildFeatures(
+  features: Uint8Array,
+  flow: Int8Array | null,
+  field: DemHeightfield,
+  featureRes: number,
+  flowRes: number,
+) {
   if (!scene) return
 
-  const res = field.resolution
+  // The mask has its own, much finer grid than the DEM: it carries surveyed
+  // polygon edges, where the DEM only carries 30m radar. Everything below
+  // works on the mask's grid and samples the DEM by world position.
+  const res = featureRes
   const spacing = field.tileSize / (res - 1)
   const half = field.tileSize / 2
+  const worldOf = (index: number) => -half + index * spacing
+  /** Water-surface height sampled from the DEM at a mask cell. */
+  const demAt = (c: number, r: number) => field.heightAt(worldOf(c), worldOf(r))
   const isWater = (c: number, r: number) =>
     c >= 0 && c < res && r >= 0 && r < res && (features[r * res + c]! & FEATURE_WATER) !== 0
 
@@ -597,7 +631,7 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
   // --- Water surface heights, relaxed along the channel ---------------------
   let heights = new Float32Array(res * res)
   for (let r = 0; r < res; r++) {
-    for (let c = 0; c < res; c++) heights[r * res + c] = field.cellHeight(c, r)
+    for (let c = 0; c < res; c++) heights[r * res + c] = demAt(c, r)
   }
   // SRTM water carries ~1m of sample-to-sample radar roughness, which utterly
   // swamps the channel's true downstream slope at the local scale. Heavy
@@ -646,7 +680,7 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
         for (let dr = -1; dr <= 1; dr++) {
           for (let dc = -1; dc <= 1; dc++) {
             if (!isWater(c + dc, r + dr)) continue
-            deviation += Math.abs(field.cellHeight(c + dc, r + dr) - heights[r * res + c]!)
+            deviation += Math.abs(demAt(c + dc, r + dr) - heights[r * res + c]!)
             samples++
           }
         }
@@ -691,8 +725,14 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
       // Flow comes from baked OSM centreline directions, not from the radar
       // water surface — its sample-to-sample noise dwarfs the channel's true
       // slope, so a derived gradient points anywhere but downstream.
-      const fx = flow ? flow[(r * res + c) * 2]! / 127 : 0
-      const fz = flow ? flow[(r * res + c) * 2 + 1]! / 127 : 0
+      let fx = 0
+      let fz = 0
+      if (flow) {
+        const fr = Math.min(flowRes - 1, Math.floor((r / res) * flowRes))
+        const fc = Math.min(flowRes - 1, Math.floor((c / res) * flowRes))
+        fx = flow[(fr * flowRes + fc) * 2]! / 127
+        fz = flow[(fr * flowRes + fc) * 2 + 1]! / 127
+      }
 
       const h00 = cornerHeight(c, r) + lift
       const h10 = cornerHeight(c + 1, r) + lift
@@ -738,16 +778,56 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
     })
 
     const isNatural = natural.value
+
+    // Shared by both stages so the fragment can rebuild the exact surface the
+    // vertex stage displaced, and take its normal analytically.
+    const WAVE_GLSL = `
+      float waveAt(float along, float across, float t) {
+        float h = 0.0;
+        h += sin(along * 1.9 - t * 3.4 + sin(across * 0.9) * 1.3) * 0.46;
+        h += sin(along * 4.3 - t * 5.1 - across * 1.7) * 0.26;
+        h += sin(across * 3.7 + along * 1.3 - t * 2.6) * 0.18;
+        h += sin(along * 8.1 + across * 5.9 - t * 7.4) * 0.10;
+        return h;
+      }
+    `
+
     waterMaterial.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = waterUniforms.uTime
       shader.uniforms.uStreak = waterUniforms.uStreak
       shader.uniforms.uDeep = waterUniforms.uDeep
       shader.uniforms.uSun = waterUniforms.uSun
+      shader.uniforms.uWave = waterUniforms.uWave
+
+      const varyings =
+        'varying vec2 vFlow;\nvarying float vTurb;\nvarying float vCover;\n' +
+        'varying vec2 vXZ;\nvarying vec3 vWorld;\nvarying vec2 vDir;\n' +
+        'varying float vAlong;\nvarying float vAcross;\n'
+
       shader.vertexShader =
-        'attribute vec2 aFlow;\nattribute float aTurb;\nattribute float aCover;\nvarying vec2 vFlow;\nvarying float vTurb;\nvarying float vCover;\nvarying vec2 vXZ;\nvarying vec3 vWorld;\n' +
+        'attribute vec2 aFlow;\nattribute float aTurb;\nattribute float aCover;\n' +
+        'uniform float uTime;\nuniform float uWave;\n' +
+        varyings +
+        WAVE_GLSL +
         shader.vertexShader.replace(
           '#include <begin_vertex>',
-          '#include <begin_vertex>\nvFlow = aFlow;\nvTurb = aTurb;\nvCover = aCover;\nvXZ = position.xz;\nvWorld = (modelMatrix * vec4(position, 1.0)).xyz;',
+          [
+            '#include <begin_vertex>',
+            'vFlow = aFlow;',
+            'vTurb = aTurb;',
+            'vCover = aCover;',
+            'vXZ = position.xz;',
+            'float flowLen = length(aFlow);',
+            'vDir = flowLen > 0.001 ? aFlow / flowLen : vec2(0.0, 1.0);',
+            'vec2 sideDir = vec2(-vDir.y, vDir.x);',
+            'vAlong = dot(position.xz, vDir);',
+            'vAcross = dot(position.xz, sideDir);',
+            // Displace the surface itself rather than painting a pattern on a
+            // flat plane. Broken water has a shape, and at this range the
+            // silhouette of the chop is most of what reads as white water.
+            'transformed.y += waveAt(vAlong, vAcross, uTime) * aTurb * uWave;',
+            'vWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;',
+          ].join('\n'),
         )
 
       const inkPass = [
@@ -762,44 +842,40 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
         '}',
       ]
 
-      // Layered advected ripples give a surface that moves with the current
-      // instead of a texture sliding over it; foam is driven by the baked
-      // turbulence, so white water appears where the river is actually broken.
       const naturalPass = [
-        'float flowMag = length(vFlow);',
-        'vec2 flowDir = flowMag > 0.001 ? vFlow / flowMag : vec2(0.0, 1.0);',
-        'vec2 side = vec2(-flowDir.y, flowDir.x);',
-        'float along = dot(vXZ, flowDir);',
-        'float across = dot(vXZ, side);',
-        'float drift = uTime * (0.5 + vTurb * 1.8) * flowMag;',
-        'float r1 = sin(along * 0.9 - drift * 2.4 + sin(across * 0.7) * 1.4);',
-        'float r2 = sin(along * 0.42 - drift * 1.5 + cos(across * 0.31) * 2.2);',
-        'float r3 = sin(across * 1.7 + along * 0.5 - drift * 3.1);',
-        'float ripple = (r1 * 0.5 + r2 * 0.34 + r3 * 0.16);',
-        // Perturb the surface normal by the ripple slope for the highlight.
-        'vec3 nrm = normalize(vec3(ripple * 0.42 * (0.3 + vTurb), 1.0, ripple * 0.24 * (0.3 + vTurb)));',
+        'float amp = vTurb * uWave;',
+        // Slope of the same surface the vertex stage built, by finite
+        // difference — cheaper and steadier than deriving it from geometry.
+        'float e = 0.35;',
+        'float h0 = waveAt(vAlong, vAcross, uTime);',
+        'float hA = waveAt(vAlong + e, vAcross, uTime);',
+        'float hC = waveAt(vAlong, vAcross + e, uTime);',
+        'vec2 sideDir = vec2(-vDir.y, vDir.x);',
+        'vec3 nrm = normalize(',
+        '  vec3(0.0, 1.0, 0.0)',
+        '  - vec3(vDir.x, 0.0, vDir.y) * ((hA - h0) / e * amp)',
+        '  - vec3(sideDir.x, 0.0, sideDir.y) * ((hC - h0) / e * amp)',
+        ');',
         'vec3 viewDir = normalize(cameraPosition - vWorld);',
         'float fres = pow(1.0 - clamp(dot(nrm, viewDir), 0.0, 1.0), 3.0);',
         'vec3 sunDir = normalize(uSun);',
-        'float spec = pow(max(dot(reflect(-sunDir, nrm), viewDir), 0.0), 90.0);',
-        // Deep where we look straight down, sky-lit at grazing angles.
-        'outgoingLight = mix(uDeep, diffuse, 0.35 + fres * 0.65);',
-        'outgoingLight += vec3(1.0, 0.97, 0.9) * spec * 0.9;',
-        // Foam: broken crests on turbulent water, plus a lace of streaks.
-        'float crest = smoothstep(0.25, 0.95, ripple) * vTurb;',
-        'float lace = smoothstep(0.6, 1.0, sin(along * 2.6 - drift * 4.0 + sin(across * 2.1) * 2.6));',
-        'float foam = clamp(crest * 0.9 + lace * vTurb * 0.7, 0.0, 1.0);',
-        // Shallow margins break white against the bank.
+        'float spec = pow(max(dot(reflect(-sunDir, nrm), viewDir), 0.0), 120.0);',
+        'outgoingLight = mix(uDeep, diffuse, 0.3 + fres * 0.7);',
+        'outgoingLight += vec3(1.0, 0.97, 0.9) * spec * 1.1;',
+        // Foam sits on the crests of the actual surface, so it moves with the
+        // water instead of sliding across it.
+        'float crest = smoothstep(0.22, 0.72, h0) * smoothstep(0.12, 0.5, vTurb);',
         'float margin = 1.0 - smoothstep(0.35, 0.95, vCover);',
-        'foam = clamp(foam + margin * 0.55 * (0.35 + vTurb), 0.0, 1.0);',
+        'float foam = clamp(crest * 1.15 + margin * 0.5 * (0.3 + vTurb), 0.0, 1.0);',
         'outgoingLight = mix(outgoingLight, uStreak, foam);',
-        // Dissolve the last of the surface into the bank rather than ending it
-        // on the grid edge.
         'diffuseColor.a *= smoothstep(0.05, 0.6, vCover);',
       ]
 
       shader.fragmentShader =
-        'uniform float uTime;\nuniform vec3 uStreak;\nuniform vec3 uDeep;\nuniform vec3 uSun;\nvarying vec2 vFlow;\nvarying float vTurb;\nvarying vec2 vXZ;\nvarying vec3 vWorld;\n' +
+        'uniform float uTime;\nuniform vec3 uStreak;\nuniform vec3 uDeep;\n' +
+        'uniform vec3 uSun;\nuniform float uWave;\n' +
+        varyings +
+        WAVE_GLSL +
         // Must land before <opaque_fragment>: that chunk writes gl_FragColor,
         // so anything done to outgoingLight or diffuseColor after it is thrown
         // away. Injecting before <fog_fragment> silently rendered flat water.
@@ -812,6 +888,61 @@ function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemH
     waterMesh = new THREE.Mesh(geometry, waterMaterial)
     waterMesh.renderOrder = 1
     scene.add(waterMesh)
+  }
+
+  // --- Boulders -------------------------------------------------------------
+  // The rapids are defined by rock standing in the water, so they are placed
+  // from the same turbulence signal as the foam: broken water is broken over
+  // something. Nothing in the elevation data resolves a boulder at 30m.
+  if (natural.value) {
+    const rockSpots: number[] = []
+    for (let r = 2; r < res - 2; r++) {
+      for (let c = 2; c < res - 2; c++) {
+        const i = r * res + c
+        if (!(features[i]! & FEATURE_WATER)) continue
+        if (turbulence[i]! < 0.45) continue
+        if (cellHash(i * 29 + 3) > 0.055) continue
+        rockSpots.push(i)
+      }
+    }
+
+    if (rockSpots.length) {
+      const rockGeometry = buildBoulderGeometry(props.seed + 4231)
+      rockMaterial = new THREE.MeshLambertMaterial({ color: NATURAL.rock, fog: true })
+      rockMesh = new THREE.InstancedMesh(rockGeometry, rockMaterial, rockSpots.length)
+      rockMesh.castShadow = true
+      rockMesh.receiveShadow = true
+      rockMesh.frustumCulled = false
+
+      const matrix = new THREE.Matrix4()
+      const quaternion = new THREE.Quaternion()
+      const euler = new THREE.Euler()
+      const scale = new THREE.Vector3()
+      const position = new THREE.Vector3()
+
+      for (let k = 0; k < rockSpots.length; k++) {
+        const i = rockSpots[k]!
+        const r = Math.floor(i / res)
+        const c = i % res
+        const x = -half + c * spacing + (cellHash(i * 31 + 1) - 0.5) * spacing
+        const z = -half + r * spacing + (cellHash(i * 37 + 2) - 0.5) * spacing
+        const size = props.boulderSize * (0.4 + cellHash(i * 41 + 5) * 1.5)
+
+        // Sit them low and part-drowned, the way rock in a rapid actually sits.
+        position.set(x, heights[i]! - size * 0.3, z)
+        euler.set(
+          (cellHash(i * 43 + 6) - 0.5) * 0.7,
+          cellHash(i * 47 + 7) * Math.PI * 2,
+          (cellHash(i * 53 + 8) - 0.5) * 0.7,
+        )
+        quaternion.setFromEuler(euler)
+        scale.set(size, size * (0.55 + cellHash(i * 59 + 9) * 0.5), size * (0.8 + cellHash(i * 61 + 10) * 0.5))
+        matrix.compose(position, quaternion, scale)
+        rockMesh.setMatrixAt(k, matrix)
+      }
+
+      scene.add(rockMesh)
+    }
   }
 
   // --- Trees ----------------------------------------------------------------
@@ -910,6 +1041,41 @@ function buildCrownGeometry(seed: number): THREE.BufferGeometry {
   return geometry
 }
 
+/**
+ * A weathered boulder: an icosahedron pushed around by a few sine lobes, then
+ * flat-shaded so it catches light in planes rather than reading as a pebble.
+ */
+function buildBoulderGeometry(seed: number): THREE.BufferGeometry {
+  const geometry = new THREE.IcosahedronGeometry(1, 1)
+  const position = geometry.attributes.position as THREE.BufferAttribute
+  const array = position.array as Float32Array
+
+  for (let i = 0; i < position.count; i++) {
+    const x = array[i * 3]!
+    const y = array[i * 3 + 1]!
+    const z = array[i * 3 + 2]!
+    const length = Math.hypot(x, y, z) || 1
+
+    const radius =
+      1 +
+      Math.sin(x * 2.1 + seed * 0.011) * 0.17 +
+      Math.cos(z * 2.6 - y * 1.7) * 0.14 +
+      Math.sin(y * 4.3 + x * 3.1) * 0.07
+
+    array[i * 3] = (x / length) * radius
+    array[i * 3 + 1] = (y / length) * radius
+    array[i * 3 + 2] = (z / length) * radius
+  }
+
+  position.needsUpdate = true
+  // Split the vertices *before* computing normals: shared vertices average into
+  // smooth shading, and rock needs to read as faces meeting at hard edges.
+  const faceted = geometry.toNonIndexed()
+  faceted.computeVertexNormals()
+  geometry.dispose()
+  return faceted
+}
+
 /** Deterministic per-cell noise, so a rebuild reproduces the same forest. */
 function cellHash(i: number): number {
   let h = Math.imul(i ^ 0x9e3779b9, 2654435761)
@@ -928,7 +1094,9 @@ function rebuildTrees(centerX: number, centerZ: number) {
   if (!treeMesh || !forestCells || !forestGrid) return
 
   const { res, spacing, half } = forestGrid
-  const reach = props.gridSize * 0.62
+  // A fixed scene plants the whole patch once; a streaming one only plants what
+  // could come into view before the next refill.
+  const reach = props.fixedScene ? props.gridSize * 0.78 : props.gridSize * 0.62
   const reachSq = reach * reach
   // One tree per this many square units of forest floor.
   const perTree = natural.value ? 90 : 240
@@ -1016,6 +1184,7 @@ function rebuildTrees(centerX: number, centerZ: number) {
 /** Refill the forest once the camera has left the area it was built around. */
 function syncTreesToCamera(force = false) {
   if (!treeMesh || !forestCells) return
+  if (props.fixedScene && !force) return
   const threshold = props.gridSize * 0.16
   if (
     force ||
@@ -1028,6 +1197,8 @@ function syncTreesToCamera(force = false) {
 /** Rebuild only when the mesh crosses into a new cell, not every frame. */
 function syncTerrainToCamera() {
   if (!mesh) return
+  // A fixed scene is built once, at the origin, and never moves.
+  if (props.fixedScene) return
   const cell = props.gridSize / props.segments
   const originX = Math.round(rig.x / cell) * cell
   const originZ = Math.round(rig.z / cell) * cell
@@ -1135,10 +1306,22 @@ function updateCamera(dt: number) {
     rig.z += -Math.cos(rig.heading) * distance
   }
 
-  // Real terrain is finite: keep the camera far enough inside the data that
-  // the visible mesh never reaches the clamped edge — the fog range ends well
-  // within gridSize/2, so the boundary is never seen.
-  if (heightfield.bounded) {
+  if (props.fixedScene) {
+    // The scene is a fixed patch of ground. Hold the camera inside the area the
+    // fog was sized for, so its edge can never come into view.
+    const distance = Math.hypot(rig.x, rig.z)
+    if (distance > props.roamRadius) {
+      const scale = props.roamRadius / distance
+      rig.x *= scale
+      rig.z *= scale
+      rig.velocityX *= 0.3
+      rig.velocityZ *= 0.3
+      rig.scrollVelocity *= 0.3
+    }
+  } else if (heightfield.bounded) {
+    // Real terrain is finite: keep the camera far enough inside the data that
+    // the visible mesh never reaches the clamped edge — the fog range ends well
+    // within gridSize/2, so the boundary is never seen.
     const limit = Math.max(0, heightfield.tileSize / 2 - props.gridSize / 2)
     rig.x = Math.max(-limit, Math.min(limit, rig.x))
     rig.z = Math.max(-limit, Math.min(limit, rig.z))
@@ -1328,6 +1511,8 @@ async function init() {
   let field: TerrainField
   let pendingFeatures: Uint8Array | null = null
   let pendingFlow: Int8Array | null = null
+  let pendingFeatureRes = 0
+  let pendingFlowRes = 0
   try {
     if (props.src) {
       const loaded = await loadDemHeightfield(props.src, {
@@ -1337,6 +1522,8 @@ async function init() {
       field = loaded.field
       pendingFeatures = loaded.features
       pendingFlow = loaded.flow
+      pendingFeatureRes = loaded.meta.featureResolution ?? loaded.meta.resolution
+      pendingFlowRes = loaded.meta.flowResolution ?? loaded.meta.resolution
       // Spawn at the terrain's featured spot when it names one. North is -z,
       // so the default heading faces north out of the box.
       if (loaded.meta.spot) {
@@ -1415,9 +1602,20 @@ async function init() {
   // terrain's straight edge appears on the horizon. The landscape starts its
   // haze later than the drawing so the middle distance survives, but it cannot
   // reach further.
-  scene.fog = natural.value
-    ? new THREE.Fog(fogColor, props.gridSize * 0.12, props.gridSize * 0.45)
-    : new THREE.Fog(fogColor, props.gridSize * 0.05, props.gridSize * 0.46)
+  if (props.fixedScene) {
+    // The camera can wander by roamRadius, so the nearest edge of a static mesh
+    // is (half - roam) away. Haze has to finish inside that or the straight cut
+    // of the terrain shows on the horizon.
+    // Finish the haze short of the mesh edge, so ground is fully dissolved
+    // before the boundary rather than at it, and start it late enough that the
+    // near and middle distance keep their colour.
+    const reach = (props.gridSize / 2 - props.roamRadius) * 0.88
+    scene.fog = new THREE.Fog(fogColor, reach * 0.3, reach)
+  } else {
+    scene.fog = natural.value
+      ? new THREE.Fog(fogColor, props.gridSize * 0.12, props.gridSize * 0.45)
+      : new THREE.Fog(fogColor, props.gridSize * 0.05, props.gridSize * 0.46)
+  }
 
   camera = new THREE.PerspectiveCamera(58, 1, 0.5, props.gridSize)
 
@@ -1490,7 +1688,11 @@ async function init() {
   mesh = new THREE.Mesh(geometry, material)
   // Heights change constantly, so a stale bounding sphere would cull wrongly.
   mesh.frustumCulled = false
-  mesh.castShadow = natural.value
+  // The ground receives shadows but does not cast them. A near-flat surface
+  // lit at a low angle self-shadows across its whole area at this mesh
+  // density — the terrain turned solid black — and the landforms here are too
+  // gentle to throw a shadow worth the artefact.
+  mesh.castShadow = false
   mesh.receiveShadow = natural.value
   scene.add(mesh)
 
@@ -1531,7 +1733,7 @@ async function init() {
   }
 
   if (pendingFeatures && heightfield instanceof DemHeightfield) {
-    buildFeatures(pendingFeatures, pendingFlow, heightfield)
+    buildFeatures(pendingFeatures, pendingFlow, heightfield, pendingFeatureRes, pendingFlowRes)
   }
 
   rig.smoothedY = groundAt(rig.x, rig.z, props.gridSize / props.segments) + props.altitude
@@ -1540,8 +1742,15 @@ async function init() {
   // viewer can still throttle up and explore deliberately.
   if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) rig.throttle = 0
 
-  // Build at the camera's cell, not the origin — the spawn may be elsewhere.
-  syncTerrainToCamera()
+  if (props.fixedScene) {
+    // syncTerrainToCamera is a no-op for a fixed scene, so the one and only
+    // build has to be made here explicitly.
+    buildTerrain(0, 0)
+    mesh.position.set(0, 0, 0)
+  } else {
+    // Build at the camera's cell, not the origin — the spawn may be elsewhere.
+    syncTerrainToCamera()
+  }
   resize()
 
   resizeObserver = new ResizeObserver(resize)
@@ -1558,6 +1767,12 @@ async function init() {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   document.addEventListener('visibilitychange', onVisibilityChange)
+
+  if (import.meta.dev) {
+    ;(window as unknown as Record<string, unknown>).__terrain = {
+      scene, mesh, material, waterMesh, treeMesh, heightfield, detailField, camera,
+    }
+  }
 
   frameHandle = requestAnimationFrame(loop)
   initialising = false
@@ -1592,6 +1807,9 @@ onBeforeUnmount(() => {
   trunkMesh?.geometry.dispose()
   trunkMesh?.dispose()
   trunkMaterial?.dispose()
+  rockMesh?.geometry.dispose()
+  rockMesh?.dispose()
+  rockMaterial?.dispose()
   skyMesh?.geometry.dispose()
   ;(skyMesh?.material as THREE.Material | undefined)?.dispose()
   renderer?.dispose()
@@ -1614,6 +1832,8 @@ onBeforeUnmount(() => {
   treeMaterial = null
   trunkMesh = null
   trunkMaterial = null
+  rockMesh = null
+  rockMaterial = null
   skyMesh = null
   waterProximity = null
   detailField = null

@@ -7,6 +7,10 @@ export interface TerrainMeta {
   lon: number
   sizeMeters: number
   resolution: number
+  /** Feature mask grid, finer than the DEM — see scripts/fetch-terrain.mjs. */
+  featureResolution?: number
+  /** Flow grid, coarser than the mask; flow varies slowly. */
+  flowResolution?: number
   minElevation: number
   maxElevation: number
   source: string
@@ -83,7 +87,12 @@ export async function loadDemHeightfield(
       (reliefMeters * exaggeration) / metersPerUnit,
     ),
     meta,
-    features: features && features.length === meta.resolution * meta.resolution ? features : null,
-    flow: flow && flow.length === meta.resolution * meta.resolution * 2 ? flow : null,
+    // Fall back to the DEM grid for terrains baked before the mask had its own.
+    features:
+      features && features.length === (meta.featureResolution ?? meta.resolution) ** 2
+        ? features
+        : null,
+    flow:
+      flow && flow.length === (meta.flowResolution ?? meta.resolution) ** 2 * 2 ? flow : null,
   }
 }

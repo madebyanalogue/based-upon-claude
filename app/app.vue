@@ -19,19 +19,26 @@ const terrainSrc = ref(terrains[0]!.src)
 const currentTerrain = computed(() => terrains.find((t) => t.src === terrainSrc.value) ?? terrains[0]!)
 
 /**
- * Close-range framing, in metres. Everything here is set against human scale:
- * a viewer 26m up, a 420m horizon, mesh detail down to about 1.6m, and trees
- * at the height Mabira's canopy actually reaches.
+ * A single fixed spot at the falls, in metres.
+ *
+ * Because the terrain is built once rather than streamed, the mesh can be an
+ * order of magnitude finer than a moving camera could afford: 0.62m spacing
+ * across a 400m patch, which is roughly 420k vertices standing still. The
+ * camera drifts within 40m of the centre; the fog is sized so the edge of that
+ * patch never comes into view.
  */
 const closeRange = {
-  altitude: 26,
-  pitch: -9,
-  gridSize: 760,
-  segments: 272,
-  speed: 15,
-  detailRelief: 7,
+  fixedScene: true,
+  roamRadius: 40,
+  altitude: 24,
+  pitch: -10,
+  gridSize: 620,
+  segments: 780,
+  speed: 9,
+  detailRelief: 4.5,
   treeHeight: 17,
-  maxLookDown: 45,
+  boulderSize: 2.4,
+  maxLookDown: 42,
 }
 const terrainTitle = ref('')
 
