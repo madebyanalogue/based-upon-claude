@@ -174,6 +174,14 @@ export class DemHeightfield extends TerrainField {
     this.amplitude = amplitude
   }
 
+  /** Raw grid height at a cell, without interpolation. Row 0 = north. */
+  cellHeight(col: number, row: number): number {
+    const res = this.resolution
+    const c = Math.min(res - 1, Math.max(0, col))
+    const r = Math.min(res - 1, Math.max(0, row))
+    return this.data[r * res + c]!
+  }
+
   heightAt(worldX: number, worldZ: number): number {
     const res = this.resolution
     const scale = (res - 1) / this.tileSize

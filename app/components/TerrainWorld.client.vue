@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import * as THREE from 'three'
-import { Heightfield, type TerrainField } from '~/lib/heightfield'
-import { loadDemHeightfield, type TerrainMeta } from '~/lib/demTerrain'
+import { Heightfield, DemHeightfield, type TerrainField } from '~/lib/heightfield'
+import {
+  loadDemHeightfield,
+  FEATURE_WATER,
+  FEATURE_FOREST,
+  type TerrainMeta,
+} from '~/lib/demTerrain'
 
 /**
  * A fly-through terrain viewport.
@@ -27,6 +32,10 @@ const THEMES: Record<Theme, {
   colorFog: string
   ambient: number
   sun: number
+  /** Water surface fill, flow-line ink, and tree-stroke ink. */
+  water: string
+  waterStreak: string
+  tree: string
 }> = {
   light: {
     colorLow: '#14232b',
@@ -34,6 +43,9 @@ const THEMES: Record<Theme, {
     colorFog: '#f2ecdf',
     ambient: 0.35,
     sun: 0.8,
+    water: '#d5ccb4',
+    waterStreak: '#31434d',
+    tree: '#2a3a42',
   },
   dark: {
     colorLow: '#24333d',
@@ -41,6 +53,9 @@ const THEMES: Record<Theme, {
     colorFog: '#0d1418',
     ambient: 0.85,
     sun: 2,
+    water: '#131f26',
+    waterStreak: '#93a7b3',
+    tree: '#77897f',
   },
 }
 
@@ -184,6 +199,9 @@ const palette = computed(() => {
     sky: props.colorSky ?? fog,
     ambient: preset.ambient,
     sun: preset.sun,
+    water: preset.water,
+    waterStreak: preset.waterStreak,
+    tree: preset.tree,
   }
 })
 
@@ -209,6 +227,17 @@ let mesh: THREE.Mesh | null = null
 let heightfield: TerrainField | null = null
 let hemiLight: THREE.HemisphereLight | null = null
 let sunLight: THREE.DirectionalLight | null = null
+let waterMesh: THREE.Mesh | null = null
+let waterMaterial: THREE.MeshBasicMaterial | null = null
+let treeMesh: THREE.InstancedMesh | null = null
+let treeMaterial: THREE.MeshBasicMaterial | null = null
+
+// Shared with the water shader; time accumulates only while rendering, so the
+// river pauses with everything else when the tab is hidden.
+const waterUniforms = {
+  uTime: { value: 0 },
+  uStreak: { value: new THREE.Color('#31434d') },
+}
 
 let frameHandle = 0
 let resizeObserver: ResizeObserver | null = null
@@ -314,6 +343,188 @@ function buildTerrain(originX: number, originZ: number) {
 
   builtOriginX = originX
   builtOriginZ = originZ
+}
+
+/**
+ * Builds the water surface and tree strokes from the baked feature mask.
+ *
+ * Water is a single static mesh over the water cells: SRTM already measures
+ * the water surface, so its heights come from the terrain data smoothed along
+ * the channel, sitting just above the ground skin. Flow direction falls out of
+ * the water surface gradient — rivers run downhill, lakes have no gradient and
+ * stay still. Trees are one InstancedMesh of small cones scattered through the
+ * forest cells: hatching marks, not botany.
+ */
+function buildFeatures(features: Uint8Array, flow: Int8Array | null, field: DemHeightfield) {
+  if (!scene) return
+
+  const res = field.resolution
+  const spacing = field.tileSize / (res - 1)
+  const half = field.tileSize / 2
+  const isWater = (c: number, r: number) =>
+    c >= 0 && c < res && r >= 0 && r < res && (features[r * res + c]! & FEATURE_WATER) !== 0
+
+  // --- Water surface heights, relaxed along the channel ---------------------
+  let heights = new Float32Array(res * res)
+  for (let r = 0; r < res; r++) {
+    for (let c = 0; c < res; c++) heights[r * res + c] = field.cellHeight(c, r)
+  }
+  // SRTM water carries ~1m of sample-to-sample radar roughness, which utterly
+  // swamps the channel's true downstream slope at the local scale. Heavy
+  // relaxation kills wavelengths shorter than ~15 cells, leaving the ramp the
+  // river actually descends — which is what flow direction must come from.
+  let scratch = new Float32Array(heights)
+  for (let pass = 0; pass < 48; pass++) {
+    for (let r = 0; r < res; r++) {
+      for (let c = 0; c < res; c++) {
+        if (!isWater(c, r)) continue
+        let sum = heights[r * res + c]!
+        let count = 1
+        if (isWater(c - 1, r)) { sum += heights[r * res + c - 1]!; count++ }
+        if (isWater(c + 1, r)) { sum += heights[r * res + c + 1]!; count++ }
+        if (isWater(c, r - 1)) { sum += heights[(r - 1) * res + c]!; count++ }
+        if (isWater(c, r + 1)) { sum += heights[(r + 1) * res + c]!; count++ }
+        scratch[r * res + c] = sum / count
+      }
+    }
+    ;[heights, scratch] = [scratch, heights]
+  }
+
+  // A corner is shared by up to four cells; averaging the water ones keeps the
+  // surface continuous across the channel instead of stepping cell to cell.
+  const cornerHeight = (c: number, r: number) => {
+    let sum = 0
+    let count = 0
+    for (const [cc, rr] of [[c - 1, r - 1], [c, r - 1], [c - 1, r], [c, r]] as const) {
+      if (isWater(cc, rr)) { sum += heights[rr * res + cc]!; count++ }
+    }
+    return count ? sum / count : 0
+  }
+
+  const positions: number[] = []
+  const flows: number[] = []
+  const lift = 0.35
+
+  for (let r = 0; r < res; r++) {
+    for (let c = 0; c < res; c++) {
+      if (!isWater(c, r)) continue
+
+      const x = -half + c * spacing
+      const z = -half + r * spacing
+
+      // Flow comes from baked OSM centreline directions, not from the radar
+      // water surface — its sample-to-sample noise dwarfs the channel's true
+      // slope, so a derived gradient points anywhere but downstream.
+      const fx = flow ? flow[(r * res + c) * 2]! / 127 : 0
+      const fz = flow ? flow[(r * res + c) * 2 + 1]! / 127 : 0
+
+      const h00 = cornerHeight(c, r) + lift
+      const h10 = cornerHeight(c + 1, r) + lift
+      const h01 = cornerHeight(c, r + 1) + lift
+      const h11 = cornerHeight(c + 1, r + 1) + lift
+      const x0 = x - spacing / 2
+      const x1 = x + spacing / 2
+      const z0 = z - spacing / 2
+      const z1 = z + spacing / 2
+
+      positions.push(x0, h00, z0, x0, h01, z1, x1, h10, z0, x1, h10, z0, x0, h01, z1, x1, h11, z1)
+      for (let i = 0; i < 6; i++) flows.push(fx, fz)
+    }
+  }
+
+  if (positions.length) {
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.setAttribute('aFlow', new THREE.Float32BufferAttribute(flows, 2))
+
+    waterUniforms.uStreak.value.set(palette.value.waterStreak)
+    waterMaterial = new THREE.MeshBasicMaterial({
+      color: palette.value.water,
+      fog: true,
+      side: THREE.DoubleSide,
+    })
+    waterMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = waterUniforms.uTime
+      shader.uniforms.uStreak = waterUniforms.uStreak
+      shader.vertexShader =
+        'attribute vec2 aFlow;\nvarying vec2 vFlow;\nvarying vec2 vXZ;\n' +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\nvFlow = aFlow;\nvXZ = position.xz;',
+        )
+      shader.fragmentShader =
+        'uniform float uTime;\nuniform vec3 uStreak;\nvarying vec2 vFlow;\nvarying vec2 vXZ;\n' +
+        shader.fragmentShader.replace(
+          '#include <fog_fragment>',
+          [
+            'float flowMag = length(vFlow);',
+            'if (flowMag > 0.03) {',
+            '  vec2 flowDir = vFlow / flowMag;',
+            '  float across = dot(vXZ, vec2(-flowDir.y, flowDir.x));',
+            '  float phase = dot(vXZ, flowDir) * 0.055 - uTime * 0.22 + sin(across * 0.3) * 0.6;',
+            '  float wave = fract(phase);',
+            '  float band = smoothstep(0.4, 0.72, wave) * smoothstep(1.0, 0.84, wave);',
+            '  outgoingLight = mix(outgoingLight, uStreak, band * flowMag * 0.9);',
+            '}',
+            '#include <fog_fragment>',
+          ].join('\n'),
+        )
+    }
+
+    waterMesh = new THREE.Mesh(geometry, waterMaterial)
+    scene.add(waterMesh)
+  }
+
+  // --- Trees ----------------------------------------------------------------
+  const forestCells: number[] = []
+  for (let i = 0; i < features.length; i++) {
+    if (features[i]! & FEATURE_FOREST) forestCells.push(i)
+  }
+
+  if (forestCells.length) {
+    const target = 42000
+    const probability = Math.min(1, target / forestCells.length)
+    const hash = (i: number) => {
+      let h = Math.imul(i ^ 0x9e3779b9, 2654435761)
+      h = Math.imul(h ^ (h >>> 15), 1274126177)
+      return ((h ^ (h >>> 16)) >>> 0) / 4294967296
+    }
+
+    const kept: number[] = []
+    for (const i of forestCells) {
+      if (hash(i) < probability) kept.push(i)
+    }
+
+    const geometry = new THREE.ConeGeometry(1.15, 7, 3, 1, true)
+    geometry.translate(0, 3.5, 0)
+    treeMaterial = new THREE.MeshBasicMaterial({ color: palette.value.tree, fog: true })
+    treeMesh = new THREE.InstancedMesh(geometry, treeMaterial, kept.length)
+
+    const matrix = new THREE.Matrix4()
+    const quaternion = new THREE.Quaternion()
+    const up = new THREE.Vector3(0, 1, 0)
+    const scale = new THREE.Vector3()
+    const position = new THREE.Vector3()
+
+    for (let k = 0; k < kept.length; k++) {
+      const i = kept[k]!
+      const r = Math.floor(i / res)
+      const c = i % res
+      const jx = (hash(i * 3 + 1) - 0.5) * spacing * 0.9
+      const jz = (hash(i * 3 + 2) - 0.5) * spacing * 0.9
+      const x = -half + c * spacing + jx
+      const z = -half + r * spacing + jz
+      const s = 0.65 + hash(i * 3 + 3) * 0.75
+
+      position.set(x, field.heightAt(x, z), z)
+      quaternion.setFromAxisAngle(up, hash(i * 5 + 4) * Math.PI * 2)
+      scale.set(s * 0.85, s, s * 0.85)
+      matrix.compose(position, quaternion, scale)
+      treeMesh.setMatrixAt(k, matrix)
+    }
+
+    scene.add(treeMesh)
+  }
 }
 
 /** Rebuild only when the mesh crosses into a new cell, not every frame. */
@@ -477,6 +688,7 @@ function loop(time: number) {
   readInput(dt)
   updateCamera(dt)
   syncTerrainToCamera()
+  waterUniforms.uTime.value += dt
   renderer.render(scene, camera)
 
   if (!hasEmittedReady) {
@@ -601,6 +813,8 @@ async function init() {
   // terrain has to be fetched, and nothing else is worth setting up until the
   // ground exists.
   let field: TerrainField
+  let pendingFeatures: Uint8Array | null = null
+  let pendingFlow: Int8Array | null = null
   try {
     if (props.src) {
       const loaded = await loadDemHeightfield(props.src, {
@@ -608,6 +822,8 @@ async function init() {
         metersPerUnit: props.metersPerUnit,
       })
       field = loaded.field
+      pendingFeatures = loaded.features
+      pendingFlow = loaded.flow
       // Spawn at the terrain's featured spot when it names one. North is -z,
       // so the default heading faces north out of the box.
       if (loaded.meta.spot) {
@@ -692,6 +908,10 @@ async function init() {
   sunLight.position.set(-0.6, 0.75, 0.45)
   scene.add(sunLight)
 
+  if (pendingFeatures && heightfield instanceof DemHeightfield) {
+    buildFeatures(pendingFeatures, pendingFlow, heightfield)
+  }
+
   rig.smoothedY = heightfield.heightAt(rig.x, rig.z) + props.altitude
 
   // Respect a stated preference for less motion by starting stationary; the
@@ -742,6 +962,11 @@ onBeforeUnmount(() => {
 
   geometry?.dispose()
   material?.dispose()
+  waterMesh?.geometry.dispose()
+  waterMaterial?.dispose()
+  treeMesh?.geometry.dispose()
+  treeMesh?.dispose()
+  treeMaterial?.dispose()
   renderer?.dispose()
   if (renderer?.domElement.parentNode) {
     renderer.domElement.parentNode.removeChild(renderer.domElement)
@@ -756,6 +981,10 @@ onBeforeUnmount(() => {
   heightfield = null
   hemiLight = null
   sunLight = null
+  waterMesh = null
+  waterMaterial = null
+  treeMesh = null
+  treeMaterial = null
   baseX = null
   baseZ = null
 })
@@ -780,6 +1009,9 @@ watch(palette, (next) => {
   if (scene.fog) scene.fog.color.set(next.fog)
   if (hemiLight) hemiLight.intensity = next.ambient
   if (sunLight) sunLight.intensity = next.sun
+  if (waterMaterial) waterMaterial.color.set(next.water)
+  if (treeMaterial) treeMaterial.color.set(next.tree)
+  waterUniforms.uStreak.value.set(next.waterStreak)
 
   // Vertex colours are baked into the buffer, so the mesh has to be rebuilt
   // rather than just re-rendered. Clearing the built origin forces that on the

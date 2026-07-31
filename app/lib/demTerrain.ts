@@ -30,11 +30,21 @@ export interface DemOptions {
  * point. Row 0 is the northern edge, which combined with the camera's default
  * heading (-z) means the view starts facing north.
  */
+/** Bit flags in the per-cell feature mask (see scripts/fetch-terrain.mjs). */
+export const FEATURE_WATER = 1
+export const FEATURE_FOREST = 2
+
 export async function loadDemHeightfield(
   src: string,
   { exaggeration, metersPerUnit }: DemOptions,
-): Promise<{ field: DemHeightfield; meta: TerrainMeta }> {
-  const [meta, bin] = await Promise.all([
+): Promise<{
+  field: DemHeightfield
+  meta: TerrainMeta
+  features: Uint8Array | null
+  /** Int8 pairs per cell: downstream flow direction, zero for still water. */
+  flow: Int8Array | null
+}> {
+  const [meta, bin, features, flow] = await Promise.all([
     fetch(`${src}.json`).then((r) => {
       if (!r.ok) throw new Error(`${src}.json -> HTTP ${r.status}`)
       return r.json() as Promise<TerrainMeta>
@@ -43,6 +53,13 @@ export async function loadDemHeightfield(
       if (!r.ok) throw new Error(`${src}.bin -> HTTP ${r.status}`)
       return r.arrayBuffer()
     }),
+    // The feature mask is optional — a terrain without one just has bare ground.
+    fetch(`${src}.features.bin`)
+      .then((r) => (r.ok ? r.arrayBuffer().then((b) => new Uint8Array(b)) : null))
+      .catch(() => null),
+    fetch(`${src}.flow.bin`)
+      .then((r) => (r.ok ? r.arrayBuffer().then((b) => new Int8Array(b)) : null))
+      .catch(() => null),
   ])
 
   const quantised = new Uint16Array(bin)
@@ -66,5 +83,7 @@ export async function loadDemHeightfield(
       (reliefMeters * exaggeration) / metersPerUnit,
     ),
     meta,
+    features: features && features.length === meta.resolution * meta.resolution ? features : null,
+    flow: flow && flow.length === meta.resolution * meta.resolution * 2 ? flow : null,
   }
 }
