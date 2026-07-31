@@ -8,6 +8,25 @@ const wireframe = ref(true)
 const theme = ref<'light' | 'dark'>('light')
 const seed = ref(1337)
 
+// Real places carry their own exaggeration: gentle landscapes need more of it
+// before their relief reads at all.
+const terrains = [
+  { label: 'Jinja', src: '/terrains/jinja', exaggeration: 5 },
+  { label: 'Procedural', src: '', exaggeration: 2.5 },
+]
+const terrainSrc = ref(terrains[0]!.src)
+const currentTerrain = computed(() => terrains.find((t) => t.src === terrainSrc.value) ?? terrains[0]!)
+const terrainTitle = ref('')
+
+function onTerrain(meta: { title: string }) {
+  terrainTitle.value = meta.title
+}
+
+function pickTerrain(src: string) {
+  terrainSrc.value = src
+  terrainTitle.value = ''
+}
+
 const readout = ref({ x: 0, z: 0, heading: 0, altitude: 0 })
 let lastReadout = 0
 
@@ -27,18 +46,32 @@ function reseed() {
 
 <template>
   <div class="stage" :class="`stage--${theme}`">
-    <!-- Keying on seed forces a clean rebuild when the world changes. -->
+    <!-- Keying on terrain + seed forces a clean rebuild when the world changes. -->
     <TerrainWorld
-      :key="seed"
+      :key="`${terrainSrc}|${seed}`"
       :mode="mode"
       :theme="theme"
       :wireframe="wireframe"
       :seed="seed"
+      :src="terrainSrc"
+      :exaggeration="currentTerrain.exaggeration"
       @move="onMove"
+      @terrain="onTerrain"
     />
 
     <div class="panel">
-      <h1>Terrain</h1>
+      <h1>{{ terrainTitle || 'Terrain' }}</h1>
+
+      <div class="row">
+        <button
+          v-for="t in terrains"
+          :key="t.src"
+          :class="{ on: terrainSrc === t.src }"
+          @click="pickTerrain(t.src)"
+        >
+          {{ t.label }}
+        </button>
+      </div>
 
       <div class="row">
         <button :class="{ on: mode === 'free' }" @click="mode = 'free'">Free</button>
@@ -51,7 +84,7 @@ function reseed() {
         <button @click="theme = theme === 'light' ? 'dark' : 'light'">
           {{ theme === 'light' ? 'Dark' : 'Light' }}
         </button>
-        <button @click="reseed">Reseed</button>
+        <button v-if="!terrainSrc" @click="reseed">Reseed</button>
       </div>
 
       <dl>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import * as THREE from 'three'
-import { Heightfield } from '~/lib/heightfield'
+import { Heightfield, type TerrainField } from '~/lib/heightfield'
+import { loadDemHeightfield, type TerrainMeta } from '~/lib/demTerrain'
 
 /**
  * A fly-through terrain viewport.
@@ -60,11 +61,21 @@ interface Props {
   gridSize?: number
   /** Mesh subdivisions per edge. Vertex count is (segments + 1)^2. */
   segments?: number
-  /** Peak terrain height. */
+  /** Peak terrain height. Procedural terrain only. */
   amplitude?: number
   seed?: number
-  /** How sharply ridges crease, 0..1. */
+  /** How sharply ridges crease, 0..1. Procedural terrain only. */
   ridge?: number
+  /**
+   * Path to a baked real-world terrain (without extension), e.g.
+   * `/terrains/jinja`. When set, the procedural options above are ignored and
+   * the camera is fenced inside the data. See scripts/fetch-terrain.mjs.
+   */
+  src?: string
+  /** Real terrain only: vertical exaggeration applied to the true relief. */
+  exaggeration?: number
+  /** Real terrain only: real metres per world unit. Lower makes the place larger. */
+  metersPerUnit?: number
   /** Picks the colour and lighting preset. Individual colours below override it. */
   theme?: Theme
   colorLow?: string
@@ -130,6 +141,9 @@ const props = withDefaults(defineProps<Props>(), {
   amplitude: 130,
   seed: 1337,
   ridge: 0.55,
+  src: '',
+  exaggeration: 2.5,
+  metersPerUnit: 5,
   // Colours are left undefined so they fall through to the theme preset; set
   // any of them to override just that one.
   theme: 'light',
@@ -178,10 +192,13 @@ const emit = defineEmits<{
   ready: []
   /** Camera pose, useful for syncing external UI. */
   move: [{ x: number; z: number; heading: number; altitude: number }]
+  /** Fires when a real-world terrain finishes loading, with its metadata. */
+  terrain: [TerrainMeta]
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
 const failed = ref(false)
+const failureText = ref('This view needs WebGL, which this browser has turned off or does not support.')
 
 let renderer: THREE.WebGLRenderer | null = null
 let scene: THREE.Scene | null = null
@@ -189,7 +206,7 @@ let camera: THREE.PerspectiveCamera | null = null
 let geometry: THREE.PlaneGeometry | null = null
 let material: THREE.MeshLambertMaterial | null = null
 let mesh: THREE.Mesh | null = null
-let heightfield: Heightfield | null = null
+let heightfield: TerrainField | null = null
 let hemiLight: THREE.HemisphereLight | null = null
 let sunLight: THREE.DirectionalLight | null = null
 
@@ -409,6 +426,15 @@ function updateCamera(dt: number) {
     rig.z += -Math.cos(rig.heading) * distance
   }
 
+  // Real terrain is finite: keep the camera far enough inside the data that
+  // the visible mesh never reaches the clamped edge — the fog range ends well
+  // within gridSize/2, so the boundary is never seen.
+  if (heightfield.bounded) {
+    const limit = Math.max(0, heightfield.tileSize / 2 - props.gridSize / 2)
+    rig.x = Math.max(-limit, Math.min(limit, rig.x))
+    rig.z = Math.max(-limit, Math.min(limit, rig.z))
+  }
+
   const ground = heightfield.heightAt(rig.x, rig.z)
   const targetY = ground + props.altitude + rig.altitudeTrim
 
@@ -565,16 +591,59 @@ function resize() {
   camera.updateProjectionMatrix()
 }
 
-function init() {
+let initialising = false
+
+async function init() {
+  if (initialising) return
+  initialising = true
+
+  // The heightfield comes first because it can be asynchronous: a real-world
+  // terrain has to be fetched, and nothing else is worth setting up until the
+  // ground exists.
+  let field: TerrainField
+  try {
+    if (props.src) {
+      const loaded = await loadDemHeightfield(props.src, {
+        exaggeration: props.exaggeration,
+        metersPerUnit: props.metersPerUnit,
+      })
+      field = loaded.field
+      // Spawn at the terrain's featured spot when it names one. North is -z,
+      // so the default heading faces north out of the box.
+      if (loaded.meta.spot) {
+        rig.x = loaded.meta.spot.eastMeters / props.metersPerUnit
+        rig.z = -loaded.meta.spot.northMeters / props.metersPerUnit
+      }
+      emit('terrain', loaded.meta)
+    } else {
+      field = new Heightfield({
+        amplitude: props.amplitude,
+        seed: props.seed,
+        ridge: props.ridge,
+      })
+    }
+  } catch (error) {
+    failureText.value = `Could not load this terrain (${error instanceof Error ? error.message : 'unknown error'}).`
+    failed.value = true
+    initialising = false
+    return
+  }
+
+  // The component may have unmounted while the terrain was in flight.
   const el = container.value
-  if (!el) return
+  if (!el) {
+    initialising = false
+    return
+  }
 
   try {
     renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
   } catch {
     failed.value = true
+    initialising = false
     return
   }
+  heightfield = field
 
   // Above 2x the cost climbs steeply for almost no visible gain.
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -589,12 +658,6 @@ function init() {
   scene.fog = new THREE.Fog(fogColor, props.gridSize * 0.05, props.gridSize * 0.46)
 
   camera = new THREE.PerspectiveCamera(58, 1, 0.5, props.gridSize)
-
-  heightfield = new Heightfield({
-    amplitude: props.amplitude,
-    seed: props.seed,
-    ridge: props.ridge,
-  })
 
   geometry = new THREE.PlaneGeometry(props.gridSize, props.gridSize, props.segments, props.segments)
   geometry.rotateX(-Math.PI / 2)
@@ -629,13 +692,14 @@ function init() {
   sunLight.position.set(-0.6, 0.75, 0.45)
   scene.add(sunLight)
 
-  rig.smoothedY = heightfield.heightAt(0, 0) + props.altitude
+  rig.smoothedY = heightfield.heightAt(rig.x, rig.z) + props.altitude
 
   // Respect a stated preference for less motion by starting stationary; the
   // viewer can still throttle up and explore deliberately.
   if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) rig.throttle = 0
 
-  buildTerrain(0, 0)
+  // Build at the camera's cell, not the origin — the spawn may be elsewhere.
+  syncTerrainToCamera()
   resize()
 
   resizeObserver = new ResizeObserver(resize)
@@ -654,6 +718,7 @@ function init() {
   document.addEventListener('visibilitychange', onVisibilityChange)
 
   frameHandle = requestAnimationFrame(loop)
+  initialising = false
 }
 
 // Nuxt's client-only wrapper resolves this ref one flush *after* onMounted on a
@@ -735,9 +800,7 @@ watch(palette, (next) => {
     @pointerleave="onPointerLeave"
     @wheel="onWheel"
   >
-    <p v-if="failed" class="terrain-world__fallback">
-      This view needs WebGL, which this browser has turned off or does not support.
-    </p>
+    <p v-if="failed" class="terrain-world__fallback">{{ failureText }}</p>
     <slot />
   </div>
 </template>

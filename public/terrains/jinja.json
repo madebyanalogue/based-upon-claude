@@ -1,0 +1,14 @@
+{
+  "title": "Jinja — Source of the Nile",
+  "lat": 0.54,
+  "lon": 33.115,
+  "sizeMeters": 27975,
+  "resolution": 732,
+  "minElevation": 1055.7,
+  "maxElevation": 1342,
+  "source": "Mapzen terrarium tiles on AWS (NASA SRTM)",
+  "spot": {
+    "northMeters": 6679,
+    "eastMeters": -6790
+  }
+}

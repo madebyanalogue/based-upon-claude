@@ -57,7 +57,10 @@ keeps the camera where it is.
 | --- | --- |
 | `app/components/TerrainWorld.client.vue` | The component |
 | `app/lib/noise.ts` | Tiling value noise |
-| `app/lib/heightfield.ts` | Baked heightfield + sampling |
+| `app/lib/heightfield.ts` | Heightfield sampling (procedural + real-world) |
+| `app/lib/demTerrain.ts` | Loader for baked real-world terrains |
+| `public/terrains/*` | Baked terrain assets |
+| `scripts/fetch-terrain.mjs` | Bake tool (dev-time only, needs `pngjs`) |
 
 `three` is the only runtime dependency. The `.client.vue` suffix keeps it out of
 SSR, which it needs since it touches WebGL directly.
@@ -86,7 +89,10 @@ The component fills its parent, so give the parent a height.
 | `gridSize` | `900` | World units across the visible mesh — effectively the view distance |
 | `segments` | `180` | Mesh subdivisions per edge; vertex count is `(segments + 1)²` |
 | `amplitude` | `130` | Peak terrain height |
-| `seed` | `1337` | Changing it generates a different world |
+| `seed` | `1337` | Changing it generates a different world (procedural only) |
+| `src` | `''` | Path to a baked real terrain, e.g. `/terrains/jinja`. Empty = procedural |
+| `exaggeration` | `2.5` | Real terrain only — vertical exaggeration of true relief |
+| `metersPerUnit` | `5` | Real terrain only — real metres per world unit |
 | `ridge` | `0.55` | How sharply ridges crease, `0`–`1` |
 | `theme` | `'light'` | `'light'` or `'dark'`. Sets colours *and* light intensities |
 | `colorLow` / `colorHigh` | from theme | Height ramp endpoints. Overrides the theme |
@@ -109,6 +115,40 @@ The component fills its parent, so give the parent a height.
 
 - `ready` — fires once the first frame has rendered
 - `move` — `{ x, z, heading, altitude }`, every frame. Throttle before putting it in the DOM
+
+## Real places
+
+Terrains can be baked from real elevation data (NASA SRTM, 30m resolution)
+instead of noise:
+
+```bash
+node scripts/fetch-terrain.mjs <slug> <lat> <lon> <km> "<title>" [spotLat spotLon]
+```
+
+This writes `public/terrains/<slug>.bin` + `.json` — small committed assets
+with no runtime dependency on the tile service. Set the component's `src` prop
+to `/terrains/<slug>` to load one; procedural options (`seed`, `ridge`,
+`amplitude`) are ignored for real terrain, and the camera is fenced inside the
+data. The optional `spot` is the featured place inside the window — the camera
+spawns there, facing north.
+
+The first baked terrain is `jinja` — the Victoria Nile from its source at Lake
+Victoria to Itanda Falls, where the camera spawns over the rapids. Notes from
+baking it, which will apply to future terrains:
+
+- **Verify the featured spot against the data, not memory or one source.** My
+  recalled coordinates for Itanda were ~7km off; the fix was tracing the river
+  channel through the heightmap (per-row minima, checked for downstream
+  monotonicity) and cross-checking against OSM Nominatim. The channel in the
+  data is the truth the camera flies over.
+- SRTM predates the Bujagali (2012) and Isimba (2019) dams, so the baked
+  terrain preserves the original gorge and rapids, not today's reservoirs.
+- Radar is noisy over turbulent water; the bake script runs a 3x3 median and
+  clamps to the 0.1/99.9 percentiles. Without this the gorge is full of spikes.
+- A waterfall itself is below 30m resolution — what reads is the gorge, the
+  stepped drop along the river, and the flat lake plane.
+- Gentle landscapes need generous vertical `exaggeration` (Jinja uses 5)
+  before their relief reads at all in wireframe.
 
 ## Modes
 

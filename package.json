@@ -12,5 +12,8 @@
   "dependencies": {
     "nuxt": "^4.4.8",
     "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "pngjs": "^7.0.0"
   }
 }
