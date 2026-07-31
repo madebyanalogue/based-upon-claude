@@ -27,18 +27,29 @@ cost.
 
 ## The look
 
-Wireframe on a `#f2ecdf` paper ground: the terrain is the ink, and the fog
-dissolves it back into the page at distance rather than fading it to a horizon.
-
-Because of that inversion, both ramp colours sit in a narrow dark band and the
-lights are pulled well down — at the earlier intensities the lit faces washed
-out toward the background instead of reading as marks on it. If you raise
-`colorHigh` toward white, drop the light intensities to match or the peaks will
-disappear into the paper.
+Default is wireframe on a `#f2ecdf` paper ground: the terrain is the ink, and
+the fog dissolves it back into the page at distance rather than fading it to a
+horizon.
 
 Setting `:wireframe="false"` gives a solid ink-wash version of the same palette,
 which is worth a look — the fog does something quite different with mass than it
 does with lines.
+
+### Themes
+
+`theme` carries **light intensities as well as colours**, because the two cannot
+be chosen independently. On paper the terrain is the ink, so the lights have to
+stay low or the lit faces wash out toward the background; on a dark ground those
+same intensities leave the landscape unreadably murky. That coupling is why
+theme is a single prop rather than a set of loose colour props.
+
+Individual colour props still override whatever the theme supplies. If you
+override them, remember the lighting is still coming from the theme — pushing
+`colorHigh` toward the background colour will make peaks disappear.
+
+Switching theme rebuilds the mesh, because the height ramp is baked into vertex
+colours rather than evaluated per frame. That happens on the next frame and
+keeps the camera where it is.
 
 ## What actually moves into the main project
 
@@ -77,8 +88,9 @@ The component fills its parent, so give the parent a height.
 | `amplitude` | `130` | Peak terrain height |
 | `seed` | `1337` | Changing it generates a different world |
 | `ridge` | `0.55` | How sharply ridges crease, `0`–`1` |
-| `colorLow` / `colorHigh` | `#14232b` / `#55655e` | Height ramp endpoints |
-| `colorFog` / `colorSky` | `#f2ecdf` | Keep these equal so the horizon stays seamless |
+| `theme` | `'light'` | `'light'` or `'dark'`. Sets colours *and* light intensities |
+| `colorLow` / `colorHigh` | from theme | Height ramp endpoints. Overrides the theme |
+| `colorFog` / `colorSky` | from theme | Keep these equal so the horizon stays seamless |
 | `wireframe` | `true` | Reactive |
 | `steerOnHover` | `true` | `fly` only — steer by pointer position, no click needed |
 | `turnRate` | `34` | `fly` only — degrees per second at full steering input |
@@ -87,7 +99,11 @@ The component fills its parent, so give the parent a height.
 | `scrollSpeed` | `1` | Multiplier on how far one scroll notch pushes |
 | `invertScroll` | `false` | Flip which scroll direction travels forward |
 | `acceleration` | `16` | `free` only — how quickly movement reaches full speed. Higher is snappier |
-| `glide` | `1.6` | `free` only — how long movement coasts once input stops. **Lower** glides further |
+| `glide` | `1.6` | `free` only — how long key movement coasts. **Lower** glides further |
+| `scrollGlide` | `0.85` | `free` only — how long a scroll push coasts. **Lower** glides further |
+| `lookGlide` | `2.4` | How quickly a released drag stops rotating. **Lower** spins on longer |
+| `maxLookUp` | `5` | Degrees above the horizon the view can be raised |
+| `maxLookDown` | `55` | Degrees below the horizon the view can be lowered |
 
 ### Events
 
@@ -110,6 +126,15 @@ are looking.
 | `R` / `F` | Raise / lower the held altitude |
 
 Scroll and drag alone are enough to explore, so the keyboard is optional.
+
+Releasing a drag lets the rotation carry on and ease to rest, so the view can be
+flicked round rather than dragged the whole way. Grabbing again stops it dead,
+the way putting a finger on a scrolling page does.
+
+Pitch is limited **against the horizon**, not symmetrically around the camera's
+resting tilt: `maxLookUp` is deliberately small because there is nothing above
+the horizon but empty background. Both limits are stated in degrees relative to
+level, so they stay meaningful if you change `pitch`.
 
 Velocity is eased rather than applied directly, so starting and stopping glides
 instead of snapping. Each scroll is a push that coasts to a stop rather than a

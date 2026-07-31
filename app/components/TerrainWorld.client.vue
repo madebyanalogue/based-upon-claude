@@ -12,6 +12,36 @@ import { Heightfield } from '~/lib/heightfield'
  */
 
 type Mode = 'free' | 'fly' | 'anchored'
+type Theme = 'light' | 'dark'
+
+/**
+ * Themes carry light intensities as well as colours, because the two cannot be
+ * chosen independently. On paper the terrain is the ink and the lights have to
+ * stay low or the lit faces wash out toward the background; on a dark ground
+ * the same intensities would leave the whole landscape unreadably murky.
+ */
+const THEMES: Record<Theme, {
+  colorLow: string
+  colorHigh: string
+  colorFog: string
+  ambient: number
+  sun: number
+}> = {
+  light: {
+    colorLow: '#14232b',
+    colorHigh: '#55655e',
+    colorFog: '#f2ecdf',
+    ambient: 0.35,
+    sun: 0.8,
+  },
+  dark: {
+    colorLow: '#24333d',
+    colorHigh: '#9aa89f',
+    colorFog: '#0d1418',
+    ambient: 0.85,
+    sun: 2,
+  },
+}
 
 interface Props {
   /**
@@ -35,6 +65,8 @@ interface Props {
   seed?: number
   /** How sharply ridges crease, 0..1. */
   ridge?: number
+  /** Picks the colour and lighting preset. Individual colours below override it. */
+  theme?: Theme
   colorLow?: string
   colorHigh?: string
   colorFog?: string
@@ -65,10 +97,26 @@ interface Props {
    */
   acceleration?: number
   /**
-   * `free` mode only: how long movement coasts once input stops. *Lower* values
-   * glide further. Shared by keys and scroll so both decelerate alike.
+   * `free` mode only: how long key movement coasts once input stops. *Lower*
+   * values glide further.
    */
   glide?: number
+  /**
+   * `free` mode only: how long a scroll push coasts. Separate from `glide` and
+   * lower by default — a flick of the wheel should carry further than letting
+   * go of a key, without making the keys feel loose.
+   */
+  scrollGlide?: number
+  /** How quickly a released drag stops rotating. *Lower* spins on longer. */
+  lookGlide?: number
+  /**
+   * How far above the horizon the view can be raised, in degrees. Kept small by
+   * default — there is nothing above the horizon but empty background, so
+   * letting the view climb into it mostly loses the landscape.
+   */
+  maxLookUp?: number
+  /** How far below the horizon the view can be lowered, in degrees. */
+  maxLookDown?: number
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -82,13 +130,9 @@ const props = withDefaults(defineProps<Props>(), {
   amplitude: 130,
   seed: 1337,
   ridge: 0.55,
-  // Inverted scheme: the terrain is the ink and the background is the paper, so
-  // both ramp colours sit in a narrow dark band and the lighting is pulled well
-  // down to keep the lit faces from washing out toward the page.
-  colorLow: '#14232b',
-  colorHigh: '#55655e',
-  colorFog: '#f2ecdf',
-  colorSky: '#f2ecdf',
+  // Colours are left undefined so they fall through to the theme preset; set
+  // any of them to override just that one.
+  theme: 'light',
   wireframe: true,
   steerOnHover: true,
   turnRate: 34,
@@ -98,6 +142,35 @@ const props = withDefaults(defineProps<Props>(), {
   invertScroll: false,
   acceleration: 16,
   glide: 1.6,
+  scrollGlide: 0.85,
+  lookGlide: 2.4,
+  maxLookUp: 5,
+  maxLookDown: 55,
+})
+
+/**
+ * Pitch limits, converted from "degrees either side of the horizon" into the
+ * offsets that `rig.lookPitch` actually holds. Stating them against the horizon
+ * keeps them meaningful when `pitch` changes — the base tilt is subtracted here
+ * rather than having to be accounted for at every call site.
+ */
+const pitchLimits = computed(() => {
+  const max = toRadians(props.maxLookUp - props.pitch)
+  const min = toRadians(-props.maxLookDown - props.pitch)
+  return { min: Math.min(min, max), max: Math.max(min, max) }
+})
+
+const palette = computed(() => {
+  const preset = THEMES[props.theme]
+  const fog = props.colorFog ?? preset.colorFog
+  return {
+    low: props.colorLow ?? preset.colorLow,
+    high: props.colorHigh ?? preset.colorHigh,
+    fog,
+    sky: props.colorSky ?? fog,
+    ambient: preset.ambient,
+    sun: preset.sun,
+  }
 })
 
 const emit = defineEmits<{
@@ -117,6 +190,8 @@ let geometry: THREE.PlaneGeometry | null = null
 let material: THREE.MeshLambertMaterial | null = null
 let mesh: THREE.Mesh | null = null
 let heightfield: Heightfield | null = null
+let hemiLight: THREE.HemisphereLight | null = null
+let sunLight: THREE.DirectionalLight | null = null
 
 let frameHandle = 0
 let resizeObserver: ResizeObserver | null = null
@@ -152,12 +227,16 @@ const rig = {
   velocityZ: 0,
   /** Forward speed contributed by scrolling. Decays on its own between events. */
   scrollVelocity: 0,
+  // Rotation carried on after a drag is released, so the view can be flicked.
+  yawVelocity: 0,
+  pitchVelocity: 0,
 }
 
 const keys = new Set<string>()
 let pointerSteer = 0
 let dragging = false
 let lastPointer = { x: 0, y: 0 }
+let lastPointerTime = 0
 let visible = true
 let documentVisible = true
 let hasEmittedReady = false
@@ -183,8 +262,8 @@ function buildTerrain(originX: number, originZ: number) {
   const colors = color.array as Float32Array
 
   const spacing = props.gridSize / props.segments
-  const low = new THREE.Color(props.colorLow)
-  const high = new THREE.Color(props.colorHigh)
+  const low = new THREE.Color(palette.value.low)
+  const high = new THREE.Color(palette.value.high)
   const n: [number, number, number] = [0, 1, 0]
   const count = position.count
   const amplitude = heightfield.amplitude || 1
@@ -273,6 +352,26 @@ function updateCamera(dt: number) {
 
   rig.steerSmoothed += (rig.steer - rig.steerSmoothed) * smoothing(5, dt)
 
+  // A released drag keeps rotating and eases to rest, so the view can be
+  // flicked round rather than dragged the whole way.
+  if (!dragging && (rig.yawVelocity !== 0 || rig.pitchVelocity !== 0)) {
+    rig.yaw += rig.yawVelocity * dt
+
+    const nextPitch = rig.lookPitch + rig.pitchVelocity * dt
+    const clamped = Math.max(pitchLimits.value.min, Math.min(pitchLimits.value.max, nextPitch))
+    // Kill the spin on contact with the clamp instead of letting it push
+    // uselessly against the limit.
+    if (clamped !== nextPitch) rig.pitchVelocity = 0
+    rig.lookPitch = clamped
+
+    const decay = Math.exp(-props.lookGlide * dt)
+    rig.yawVelocity *= decay
+    rig.pitchVelocity *= decay
+
+    if (Math.abs(rig.yawVelocity) < 0.002) rig.yawVelocity = 0
+    if (Math.abs(rig.pitchVelocity) < 0.002) rig.pitchVelocity = 0
+  }
+
   if (props.mode === 'free') {
     // Movement is relative to where the viewer is looking, so forward always
     // means "the way I am facing".
@@ -295,7 +394,7 @@ function updateCamera(dt: number) {
 
     // Each scroll is a push that coasts to a stop rather than a fixed step, so
     // a flick of the wheel glides instead of teleporting.
-    rig.scrollVelocity *= Math.exp(-props.glide * dt)
+    rig.scrollVelocity *= Math.exp(-props.scrollGlide * dt)
     if (Math.abs(rig.scrollVelocity) < 0.05) rig.scrollVelocity = 0
 
     rig.x += (rig.velocityX + forwardX * rig.scrollVelocity) * dt
@@ -377,13 +476,24 @@ function onPointerMove(event: PointerEvent) {
   if (props.mode === 'free' || props.mode === 'anchored') {
     if (!dragging) return
     const sensitivity = toRadians(props.lookSensitivity)
-    rig.yaw -= ((event.clientX - lastPointer.x) / rect.width) * sensitivity
-    // Pitch is clamped short of straight up or down so the horizon never rolls
-    // out of frame and the view cannot invert.
-    rig.lookPitch = Math.max(
-      -0.55,
-      Math.min(0.55, rig.lookPitch - ((event.clientY - lastPointer.y) / rect.height) * sensitivity * 0.6),
-    )
+
+    const deltaYaw = -((event.clientX - lastPointer.x) / rect.width) * sensitivity
+    const deltaPitch = -((event.clientY - lastPointer.y) / rect.height) * sensitivity * 0.6
+
+    rig.yaw += deltaYaw
+    // Pitch is clamped against the horizon so the view cannot invert or climb
+    // into empty background.
+    const { min, max } = pitchLimits.value
+    rig.lookPitch = Math.max(min, Math.min(max, rig.lookPitch + deltaPitch))
+
+    // Track the rate of the drag so releasing it can carry on. Blended rather
+    // than taken raw, so one jittery event near the end cannot define the flick.
+    const now = performance.now()
+    const elapsed = Math.min(0.1, Math.max(0.008, (now - lastPointerTime) / 1000))
+    lastPointerTime = now
+    rig.yawVelocity = rig.yawVelocity * 0.55 + (deltaYaw / elapsed) * 0.45
+    rig.pitchVelocity = rig.pitchVelocity * 0.55 + (deltaPitch / elapsed) * 0.45
+
     lastPointer = { x: event.clientX, y: event.clientY }
     return
   }
@@ -423,6 +533,11 @@ function onWheel(event: WheelEvent) {
 function onPointerDown(event: PointerEvent) {
   dragging = true
   lastPointer = { x: event.clientX, y: event.clientY }
+  lastPointerTime = performance.now()
+  // Catching a spinning view should stop it dead, the way putting a finger on a
+  // scrolling page does.
+  rig.yawVelocity = 0
+  rig.pitchVelocity = 0
   container.value?.setPointerCapture(event.pointerId)
 }
 
@@ -465,10 +580,10 @@ function init() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   el.appendChild(renderer.domElement)
 
-  const fogColor = new THREE.Color(props.colorFog)
+  const fogColor = new THREE.Color(palette.value.fog)
 
   scene = new THREE.Scene()
-  scene.background = new THREE.Color(props.colorSky)
+  scene.background = new THREE.Color(palette.value.sky)
   // Fog far is kept inside the mesh half-width so the terrain's straight edge
   // is always fully dissolved before it can be seen.
   scene.fog = new THREE.Fog(fogColor, props.gridSize * 0.05, props.gridSize * 0.46)
@@ -505,13 +620,14 @@ function init() {
   mesh.frustumCulled = false
   scene.add(mesh)
 
-  scene.add(new THREE.HemisphereLight(0x93a7b3, 0x10161a, 0.35))
+  hemiLight = new THREE.HemisphereLight(0x93a7b3, 0x10161a, palette.value.ambient)
+  scene.add(hemiLight)
   // A single sun gives the ridges a long lit face and a deep shaded one, which
   // is what separates them from each other at distance. Kept above 45° so that
   // flat lowland still catches enough light to read when the seed lands there.
-  const sun = new THREE.DirectionalLight(0xffe4c4, 0.8)
-  sun.position.set(-0.6, 0.75, 0.45)
-  scene.add(sun)
+  sunLight = new THREE.DirectionalLight(0xffe4c4, palette.value.sun)
+  sunLight.position.set(-0.6, 0.75, 0.45)
+  scene.add(sunLight)
 
   rig.smoothedY = heightfield.heightAt(0, 0) + props.altitude
 
@@ -573,6 +689,8 @@ onBeforeUnmount(() => {
   material = null
   mesh = null
   heightfield = null
+  hemiLight = null
+  sunLight = null
   baseX = null
   baseZ = null
 })
@@ -583,6 +701,27 @@ watch(
     if (material) material.wireframe = props.wireframe
   },
 )
+
+// Tightening the limits at runtime should pull the current view back inside
+// them rather than leaving it stuck outside until the next drag.
+watch(pitchLimits, ({ min, max }) => {
+  rig.lookPitch = Math.max(min, Math.min(max, rig.lookPitch))
+})
+
+watch(palette, (next) => {
+  if (!scene) return
+
+  if (scene.background instanceof THREE.Color) scene.background.set(next.sky)
+  if (scene.fog) scene.fog.color.set(next.fog)
+  if (hemiLight) hemiLight.intensity = next.ambient
+  if (sunLight) sunLight.intensity = next.sun
+
+  // Vertex colours are baked into the buffer, so the mesh has to be rebuilt
+  // rather than just re-rendered. Clearing the built origin forces that on the
+  // next frame without duplicating the rebuild logic here.
+  builtOriginX = Number.NaN
+  builtOriginZ = Number.NaN
+})
 </script>
 
 <template>

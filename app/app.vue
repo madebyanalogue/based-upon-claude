@@ -5,6 +5,7 @@
  */
 const mode = ref<'free' | 'fly' | 'anchored'>('free')
 const wireframe = ref(true)
+const theme = ref<'light' | 'dark'>('light')
 const seed = ref(1337)
 
 const readout = ref({ x: 0, z: 0, heading: 0, altitude: 0 })
@@ -25,11 +26,12 @@ function reseed() {
 </script>
 
 <template>
-  <div class="stage">
+  <div class="stage" :class="`stage--${theme}`">
     <!-- Keying on seed forces a clean rebuild when the world changes. -->
     <TerrainWorld
       :key="seed"
       :mode="mode"
+      :theme="theme"
       :wireframe="wireframe"
       :seed="seed"
       @move="onMove"
@@ -46,6 +48,9 @@ function reseed() {
 
       <div class="row">
         <button :class="{ on: wireframe }" @click="wireframe = !wireframe">Wireframe</button>
+        <button @click="theme = theme === 'light' ? 'dark' : 'light'">
+          {{ theme === 'light' ? 'Dark' : 'Light' }}
+        </button>
         <button @click="reseed">Reseed</button>
       </div>
 
@@ -90,6 +95,16 @@ body {
   height: 100vh;
 }
 
+.stage--light {
+  --paper: 242, 236, 223;
+  --ink: 20, 35, 43;
+}
+
+.stage--dark {
+  --paper: 13, 20, 24;
+  --ink: 207, 216, 207;
+}
+
 .panel {
   position: absolute;
   top: 1.5rem;
@@ -97,9 +112,9 @@ body {
   z-index: 2;
   padding: 1rem 1.25rem;
   min-width: 13rem;
-  color: #14232b;
-  background: rgba(242, 236, 223, 0.78);
-  border: 1px solid rgba(20, 35, 43, 0.18);
+  color: rgb(var(--ink));
+  background: rgba(var(--paper), 0.78);
+  border: 1px solid rgba(var(--ink), 0.18);
   border-radius: 0.5rem;
   backdrop-filter: blur(8px);
   font-size: 0.75rem;
@@ -127,20 +142,20 @@ button {
   color: inherit;
   font: inherit;
   font-size: 0.7rem;
-  background: rgba(20, 35, 43, 0.05);
-  border: 1px solid rgba(20, 35, 43, 0.2);
+  background: rgba(var(--ink), 0.05);
+  border: 1px solid rgba(var(--ink), 0.2);
   border-radius: 0.25rem;
   cursor: pointer;
 }
 
 button:hover {
-  background: rgba(20, 35, 43, 0.11);
+  background: rgba(var(--ink), 0.11);
 }
 
 button.on {
-  color: #f2ecdf;
-  background: #14232b;
-  border-color: #14232b;
+  color: rgb(var(--paper));
+  background: rgb(var(--ink));
+  border-color: rgb(var(--ink));
 }
 
 dl {
