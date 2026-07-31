@@ -16,10 +16,14 @@ npm install && npm run dev
 
 ## The idea
 
-The camera holds a **fixed framing** — a constant height above the ground below
-it and a constant pitch — while the viewer steers. The terrain is a single mesh
-that follows the camera and re-reads its heights from a tiling heightfield, so
-the world reads as unbounded at a fixed vertex cost.
+The viewer explores under their own power — **nothing moves unless they move
+it**. What stays fixed is the framing: the camera holds a constant height above
+the ground below it, so the relationship to the landscape never changes no
+matter where they go.
+
+The terrain is a single mesh that follows the camera and re-reads its heights
+from a tiling heightfield, so the world reads as unbounded at a fixed vertex
+cost.
 
 ## What actually moves into the main project
 
@@ -49,8 +53,8 @@ The component fills its parent, so give the parent a height.
 
 | Prop | Default | Notes |
 | --- | --- | --- |
-| `mode` | `'fly'` | `'fly'` moves forward and steers; `'anchored'` pins the camera and drags to look |
-| `speed` | `34` | Cruise speed in world units per second |
+| `mode` | `'free'` | See *Modes* below |
+| `speed` | `46` | Top speed in world units per second |
 | `altitude` | `70` | Height held above the ground below |
 | `pitch` | `-14` | Downward tilt in degrees |
 | `gridSize` | `900` | World units across the visible mesh — effectively the view distance |
@@ -61,18 +65,42 @@ The component fills its parent, so give the parent a height.
 | `colorLow` / `colorHigh` | | Height ramp endpoints. Keep these muted — lighting supplies the brightness |
 | `colorFog` / `colorSky` | | Keep these equal so the horizon stays seamless |
 | `wireframe` | `false` | Reactive |
-| `steerOnHover` | `true` | Steer by pointer position, no click needed |
-| `turnRate` | `34` | Degrees per second at full steering input |
+| `steerOnHover` | `true` | `fly` only — steer by pointer position, no click needed |
+| `turnRate` | `34` | `fly` only — degrees per second at full steering input |
+| `lookSensitivity` | `140` | `free` only — degrees turned by a full drag across the viewport |
 
 ### Events
 
 - `ready` — fires once the first frame has rendered
 - `move` — `{ x, z, heading, altitude }`, every frame. Throttle before putting it in the DOM
 
-### Controls
+## Modes
 
-Pointer left/right steers (with a dead zone in the middle). `A`/`D` steer,
-`W`/`S` throttle, `↑`/`↓` altitude. In anchored mode, drag to look around.
+### `free` (default)
+
+Nothing moves unless the viewer holds a key. Movement is relative to where they
+are looking.
+
+| Input | Action |
+| --- | --- |
+| `W` / `S` or `↑` / `↓` | Forward and back |
+| `A` / `D` or `←` / `→` | Sideways (strafe) |
+| Drag | Look around |
+| `R` / `F` | Raise / lower the held altitude |
+
+Velocity is eased rather than applied directly, so starting and stopping glides
+instead of snapping. Pitch is clamped short of vertical so the view cannot
+invert.
+
+### `fly`
+
+Moves forward continuously; the viewer only steers. Pointer left/right steers
+with a dead zone in the middle, `A`/`D` steer, `W`/`S` throttle, `↑`/`↓`
+altitude. Banks into turns.
+
+### `anchored`
+
+Camera pinned in place. Drag to look around.
 
 ## Notes for future work
 
@@ -92,4 +120,5 @@ Pointer left/right steers (with a dead zone in the middle). `A`/`D` steer,
 ### Not built yet
 
 Level of detail (distant terrain uses the same density as near), any content on
-the terrain, collision, and touch steering beyond drag.
+the terrain, collision, on-screen controls for touch devices, and pointer-lock
+mouse-look as an alternative to dragging.

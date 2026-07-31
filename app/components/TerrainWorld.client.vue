@@ -11,12 +11,16 @@ import { Heightfield } from '~/lib/heightfield'
  * so the world reads as unbounded at a fixed vertex cost.
  */
 
-type Mode = 'fly' | 'anchored'
+type Mode = 'free' | 'fly' | 'anchored'
 
 interface Props {
-  /** `fly` moves forward continuously and steers. `anchored` pins the camera and looks around. */
+  /**
+   * `free` moves only while a key is held — forward/back and strafe, drag to
+   * look. `fly` moves forward continuously and steers. `anchored` pins the
+   * camera in place and looks around.
+   */
   mode?: Mode
-  /** Cruise speed in world units per second. */
+  /** Top speed in world units per second. */
   speed?: number
   /** Height held above the ground directly below. */
   altitude?: number
@@ -36,15 +40,17 @@ interface Props {
   colorFog?: string
   colorSky?: string
   wireframe?: boolean
-  /** Steer by moving the pointer across the viewport, no click needed. */
+  /** `fly` mode only: steer by pointer position, no click needed. */
   steerOnHover?: boolean
-  /** Degrees per second at full steering input. */
+  /** `fly` mode only: degrees per second at full steering input. */
   turnRate?: number
+  /** `free` mode only: how far a full drag across the viewport turns the view, in degrees. */
+  lookSensitivity?: number
 }
 
 const props = withDefaults(defineProps<Props>(), {
-  mode: 'fly',
-  speed: 34,
+  mode: 'free',
+  speed: 46,
   // High enough to read the landforms as landscape rather than skim them.
   altitude: 70,
   pitch: -14,
@@ -62,6 +68,7 @@ const props = withDefaults(defineProps<Props>(), {
   wireframe: false,
   steerOnHover: true,
   turnRate: 34,
+  lookSensitivity: 140,
 })
 
 const emit = defineEmits<{
@@ -98,14 +105,22 @@ let builtOriginZ = Number.NaN
 const rig = {
   x: 0,
   z: 0,
+  /** `fly` mode: the direction of travel, which the viewer steers. */
   heading: 0,
-  yaw: 0, // anchored mode only
-  lookPitch: 0, // anchored mode only
+  /** `free` and `anchored` modes: the direction the viewer is looking. */
+  yaw: 0,
+  lookPitch: 0,
   smoothedY: 0,
   steer: 0,
   steerSmoothed: 0,
   throttle: 1,
   altitudeTrim: 0,
+  // `free` mode. Velocity is carried between frames rather than applied
+  // directly, so starting and stopping eases instead of snapping.
+  moveForward: 0,
+  moveStrafe: 0,
+  velocityX: 0,
+  velocityZ: 0,
 }
 
 const keys = new Set<string>()
@@ -188,6 +203,24 @@ function syncTerrainToCamera() {
 }
 
 function readInput(dt: number) {
+  if (props.mode === 'free') {
+    let forward = 0
+    let strafe = 0
+    if (keys.has('w') || keys.has('arrowup')) forward += 1
+    if (keys.has('s') || keys.has('arrowdown')) forward -= 1
+    if (keys.has('d') || keys.has('arrowright')) strafe += 1
+    if (keys.has('a') || keys.has('arrowleft')) strafe -= 1
+
+    // Normalise so moving on both axes is not faster than moving on one.
+    const magnitude = Math.hypot(forward, strafe)
+    rig.moveForward = magnitude > 1 ? forward / magnitude : forward
+    rig.moveStrafe = magnitude > 1 ? strafe / magnitude : strafe
+
+    if (keys.has('r')) rig.altitudeTrim = Math.min(160, rig.altitudeTrim + dt * 40)
+    if (keys.has('f')) rig.altitudeTrim = Math.max(-18, rig.altitudeTrim - dt * 40)
+    return
+  }
+
   let steer = 0
   if (keys.has('a') || keys.has('arrowleft')) steer -= 1
   if (keys.has('d') || keys.has('arrowright')) steer += 1
@@ -208,6 +241,24 @@ function updateCamera(dt: number) {
   if (!camera || !heightfield) return
 
   rig.steerSmoothed += (rig.steer - rig.steerSmoothed) * smoothing(5, dt)
+
+  if (props.mode === 'free') {
+    // Movement is relative to where the viewer is looking, so forward always
+    // means "the way I am facing".
+    const forwardX = -Math.sin(rig.yaw)
+    const forwardZ = -Math.cos(rig.yaw)
+    const rightX = Math.cos(rig.yaw)
+    const rightZ = -Math.sin(rig.yaw)
+
+    const targetX = (forwardX * rig.moveForward + rightX * rig.moveStrafe) * props.speed
+    const targetZ = (forwardZ * rig.moveForward + rightZ * rig.moveStrafe) * props.speed
+
+    rig.velocityX += (targetX - rig.velocityX) * smoothing(6, dt)
+    rig.velocityZ += (targetZ - rig.velocityZ) * smoothing(6, dt)
+
+    rig.x += rig.velocityX * dt
+    rig.z += rig.velocityZ * dt
+  }
 
   if (props.mode === 'fly') {
     rig.heading -= rig.steerSmoothed * toRadians(props.turnRate) * dt
@@ -236,7 +287,7 @@ function updateCamera(dt: number) {
   emit('move', {
     x: rig.x,
     z: rig.z,
-    heading: rig.heading,
+    heading: props.mode === 'fly' ? rig.heading : rig.yaw,
     altitude: rig.smoothedY - ground,
   })
 }
@@ -281,12 +332,15 @@ function onPointerMove(event: PointerEvent) {
   if (!container.value) return
   const rect = container.value.getBoundingClientRect()
 
-  if (props.mode === 'anchored') {
+  if (props.mode === 'free' || props.mode === 'anchored') {
     if (!dragging) return
-    rig.yaw -= ((event.clientX - lastPointer.x) / rect.width) * 2.4
+    const sensitivity = toRadians(props.lookSensitivity)
+    rig.yaw -= ((event.clientX - lastPointer.x) / rect.width) * sensitivity
+    // Pitch is clamped short of straight up or down so the horizon never rolls
+    // out of frame and the view cannot invert.
     rig.lookPitch = Math.max(
-      -0.6,
-      Math.min(0.6, rig.lookPitch - ((event.clientY - lastPointer.y) / rect.height) * 1.6),
+      -0.55,
+      Math.min(0.55, rig.lookPitch - ((event.clientY - lastPointer.y) / rect.height) * sensitivity * 0.6),
     )
     lastPointer = { x: event.clientX, y: event.clientY }
     return
@@ -472,6 +526,7 @@ watch(
   <div
     ref="container"
     class="terrain-world"
+    :class="{ 'terrain-world--draggable': mode !== 'fly' }"
     @pointermove="onPointerMove"
     @pointerdown="onPointerDown"
     @pointerup="onPointerUp"
@@ -492,6 +547,14 @@ watch(
   overflow: hidden;
   touch-action: none;
   cursor: crosshair;
+}
+
+.terrain-world--draggable {
+  cursor: grab;
+}
+
+.terrain-world--draggable:active {
+  cursor: grabbing;
 }
 
 .terrain-world :deep(canvas) {

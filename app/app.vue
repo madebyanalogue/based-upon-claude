@@ -3,7 +3,7 @@
  * Development harness only. This file exists so the component can be built and
  * judged in isolation — it is not intended to move into the main project.
  */
-const mode = ref<'fly' | 'anchored'>('fly')
+const mode = ref<'free' | 'fly' | 'anchored'>('free')
 const wireframe = ref(false)
 const seed = ref(1337)
 
@@ -39,6 +39,7 @@ function reseed() {
       <h1>Terrain</h1>
 
       <div class="row">
+        <button :class="{ on: mode === 'free' }" @click="mode = 'free'">Free</button>
         <button :class="{ on: mode === 'fly' }" @click="mode = 'fly'">Fly</button>
         <button :class="{ on: mode === 'anchored' }" @click="mode = 'anchored'">Anchored</button>
       </div>
@@ -54,11 +55,16 @@ function reseed() {
         <div><dt>alt</dt><dd>{{ readout.altitude.toFixed(0) }}</dd></div>
       </dl>
 
-      <p class="hint">
-        Move the pointer left or right to steer.
-        <br />A / D steer · W / S throttle · ↑ / ↓ altitude
-        <br />In anchored mode, drag to look around.
+      <p v-if="mode === 'free'" class="hint">
+        Drag to look around.
+        <br />W / S forward and back · A / D sideways
+        <br />R / F altitude · nothing moves unless you hold a key
       </p>
+      <p v-else-if="mode === 'fly'" class="hint">
+        Moves forward on its own. Pointer left or right steers.
+        <br />A / D steer · W / S throttle · ↑ / ↓ altitude
+      </p>
+      <p v-else class="hint">Fixed in place. Drag to look around.</p>
     </div>
   </div>
 </template>
