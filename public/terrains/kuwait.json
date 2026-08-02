@@ -1,0 +1,12 @@
+{
+  "title": "Jal Az-Zor, Kuwait",
+  "lat": 29.42,
+  "lon": 47.68,
+  "sizeMeters": 616,
+  "resolution": 74,
+  "featureResolution": 1024,
+  "flowResolution": 256,
+  "minElevation": 62.1,
+  "maxElevation": 129,
+  "source": "Mapzen terrarium tiles on AWS (NASA SRTM)"
+}

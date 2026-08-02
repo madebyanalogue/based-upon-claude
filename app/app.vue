@@ -12,8 +12,9 @@ const seed = ref(1337)
 // Jinja is baked at close range: one world unit is one metre, so the camera
 // altitude, tree heights and relief below are all real-world figures.
 const terrains = [
-  { label: 'Jinja', src: '/terrains/jinja', exaggeration: 1.8, metersPerUnit: 1 },
-  { label: 'Procedural', src: '', exaggeration: 2.5, metersPerUnit: 5 },
+  { label: 'Jinja', src: '/terrains/jinja', exaggeration: 1.8, metersPerUnit: 1, biome: 'temperate' as const },
+  { label: 'Kuwait', src: '/terrains/kuwait', exaggeration: 1.5, metersPerUnit: 1, biome: 'desert' as const },
+  { label: 'Procedural', src: '', exaggeration: 2.5, metersPerUnit: 5, biome: 'temperate' as const },
 ]
 const terrainSrc = ref(terrains[0]!.src)
 const currentTerrain = computed(() => terrains.find((t) => t.src === terrainSrc.value) ?? terrains[0]!)
@@ -73,6 +74,7 @@ function reseed() {
     <!-- Keying on terrain + seed forces a clean rebuild when the world changes. -->
     <TerrainWorld
       :key="`${terrainSrc}|${seed}|${style}`"
+      :biome="currentTerrain.biome"
       :mode="mode"
       :theme="theme"
       :render-style="style"

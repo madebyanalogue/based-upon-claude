@@ -21,6 +21,31 @@ import {
 type Mode = 'free' | 'fly' | 'anchored'
 type Theme = 'light' | 'dark'
 type Style = 'ink' | 'natural'
+type Biome = 'temperate' | 'desert'
+
+/**
+ * The desert palette. Sand is lit very differently from vegetation: it is
+ * bright, it bounces a lot of light back up into the air, and the air itself
+ * carries dust — so ambient runs high and the haze is warm rather than blue.
+ */
+const DESERT = {
+  /** Sand ramp: shaded hollows, open sand, and sun-bleached crests. */
+  sandShade: '#8a6f4a',
+  sand: '#b4966a',
+  sandLit: '#d6bd92',
+  /** Exposed rock on the escarpment face, where sand cannot hold. */
+  rock: '#8a7658',
+  rockDark: '#6b5942',
+  // Dust in the air: haze and the sky's horizon band have to match exactly, or
+  // a line appears along the top of the mesh.
+  haze: '#dcc4a2',
+  skyHorizon: '#dcc4a2',
+  skyZenith: '#6f97c4',
+  dust: '#e3d0ad',
+  ambient: 0.56,
+  sun: 3.2,
+  sunColor: '#fff0d2',
+}
 
 /**
  * The naturalistic palette. Separate from THEMES because it is not a recolour
@@ -150,6 +175,20 @@ interface Props {
    * relief and naturalistic colour, where `theme` no longer applies.
    */
   renderStyle?: Style
+  /**
+   * What the ground is made of. `temperate` is soil and vegetation; `desert`
+   * replaces the relief with wind-shaped sand, drops vegetation entirely, and
+   * puts dust in the air.
+   */
+  biome?: Biome
+  /** Compass bearing the wind blows *toward*, in degrees. */
+  windDirection?: number
+  /** Wind strength, 0..2ish. Drives ripple sharpness, drift speed and dust. */
+  windSpeed?: number
+  /** `desert` only: height of the dune forms, in world units. */
+  duneHeight?: number
+  /** `desert` only: distance between dune crests, in world units. */
+  duneWavelength?: number
   colorLow?: string
   colorHigh?: string
   colorFog?: string
@@ -225,6 +264,12 @@ const props = withDefaults(defineProps<Props>(), {
   // any of them to override just that one.
   theme: 'light',
   renderStyle: 'ink',
+  biome: 'temperate',
+  // Kuwait's prevailing wind is the shamal, out of the north-west.
+  windDirection: 135,
+  windSpeed: 1,
+  duneHeight: 2.2,
+  duneWavelength: 46,
   wireframe: true,
   steerOnHover: true,
   turnRate: 34,
@@ -255,6 +300,19 @@ const pitchLimits = computed(() => {
 const natural = computed(() => props.renderStyle === 'natural')
 
 const palette = computed(() => {
+  if (desert.value) {
+    return {
+      low: DESERT.sandShade,
+      high: DESERT.sandLit,
+      fog: props.colorFog ?? DESERT.haze,
+      sky: props.colorSky ?? DESERT.skyHorizon,
+      ambient: DESERT.ambient,
+      sun: DESERT.sun,
+      water: DESERT.sand,
+      waterStreak: DESERT.sandLit,
+      tree: DESERT.rock,
+    }
+  }
   if (natural.value) {
     return {
       low: NATURAL.lowland,
@@ -314,6 +372,8 @@ let trunkMaterial: THREE.Material | null = null
 let rockMesh: THREE.InstancedMesh | null = null
 let rockMaterial: THREE.Material | null = null
 let skyMesh: THREE.Mesh | null = null
+let dustPoints: THREE.Points | null = null
+let dustMaterial: THREE.ShaderMaterial | null = null
 
 /** Upper bound on trees held in the instance buffers at once. */
 const TREE_CAPACITY = 26000
@@ -340,8 +400,111 @@ let waterProximity: ((worldX: number, worldZ: number) => number) | null = null
  */
 let detailField: Heightfield | null = null
 
+const desert = computed(() => natural.value && props.biome === 'desert')
+
+/**
+ * Direction to the sun.
+ *
+ * Desert sits far lower than the temperate default. Sand relief is shallow —
+ * ripples tilt the surface by a few degrees — so an overhead sun gives almost
+ * no variation in n·l and the dunes render as a flat wash. A raking light makes
+ * the same geometry legible, which is why desert photographs are taken at the
+ * ends of the day.
+ */
+const sunDirection = computed(() =>
+  desert.value
+    ? new THREE.Vector3(-0.82, 0.2, 0.53).normalize()
+    : new THREE.Vector3(-0.6, 0.75, 0.45).normalize(),
+)
+
+/** Unit vector the wind blows toward, in world XZ. */
+const windVector = computed(() => {
+  const radians = (props.windDirection * Math.PI) / 180
+  // Compass bearing: 0 is north (-z), 90 is east (+x).
+  return { x: Math.sin(radians), z: -Math.cos(radians) }
+})
+
+/**
+ * Wind-shaped sand.
+ *
+ * Sand is anisotropic in a way fbm is not: dunes and ripples run as parallel
+ * crests square to the wind, and each crest climbs gently on the windward side
+ * and drops sharply down the slip face. That asymmetry is the whole reason a
+ * dune reads as a dune, so it is built analytically in wind space and only
+ * *perturbed* by noise, rather than being noise that happens to be beige.
+ */
+function sandRelief(worldX: number, worldZ: number, steepness: number): number {
+  if (!detailField) return 0
+
+  const wind = windVector.value
+  const along = worldX * wind.x + worldZ * wind.z
+  const across = -worldX * wind.z + worldZ * wind.x
+
+  // Sand cannot rest on the escarpment face; it collects on gentle ground.
+  const holding = Math.max(0, 1 - steepness * 2.6)
+
+  // Wander the crest lines so they are not dead straight, and vary their
+  // spacing along their length.
+  const wander = (detailField.heightAt(worldX * 0.06, worldZ * 0.06) - 0.5) * 2
+  const drift = (detailField.heightAt(worldX * 0.22, worldZ * 0.22) - 0.5) * 2
+
+  // --- Dunes --------------------------------------------------------------
+  const dunePhase =
+    along / props.duneWavelength + wander * 0.55 + Math.sin(across / (props.duneWavelength * 1.9)) * 0.4
+  const duneFrac = dunePhase - Math.floor(dunePhase)
+  // Climb over ~72% of the cycle, drop over the rest: the slip face is short
+  // and steep, the windward slope long and shallow.
+  const windwardShare = 0.72
+  const dune =
+    duneFrac < windwardShare
+      ? smoothstep01(duneFrac / windwardShare)
+      : 1 - smoothstep01((duneFrac - windwardShare) / (1 - windwardShare))
+
+  // --- Ripples ------------------------------------------------------------
+  // Kept well above the mesh spacing, otherwise they alias into noise. Finer
+  // ripples than this live in the shader's normals, not in geometry.
+  const rippleWavelength = 5.4
+  // Bent hard along their length and drifting in spacing, so crests curve and
+  // fork the way real ripple trains do instead of running as parallel stripes.
+  // Phase noise has to stay well under half a wavelength. Pushed past that it
+  // stops bending the crests and starts scrambling them, and a ripple train
+  // that changes phase faster than the mesh can sample it averages to a flat
+  // surface — which is exactly what happened.
+  const ripplePhase =
+    along / rippleWavelength +
+    drift * 0.34 +
+    wander * 0.28 +
+    Math.sin(across / 34) * 0.5 +
+    across * 0.004
+  const rippleFrac = ripplePhase - Math.floor(ripplePhase)
+  const ripple =
+    rippleFrac < 0.68
+      ? smoothstep01(rippleFrac / 0.68)
+      : 1 - smoothstep01((rippleFrac - 0.68) / 0.32)
+
+  const strength = 0.45 + props.windSpeed * 0.55
+  return (
+    holding *
+    ((dune - 0.5) * props.duneHeight * 2 + (ripple - 0.5) * 0.5 * strength)
+  )
+}
+
+function smoothstep01(t: number): number {
+  const x = Math.min(1, Math.max(0, t))
+  return x * x * (3 - 2 * x)
+}
+
 /** Detail displacement at a point, already faded out over water. */
 function detailAt(worldX: number, worldZ: number, steepness: number): number {
+  if (desert.value) {
+    // Sand replaces the rocky relief rather than layering on top of it; the
+    // two together read as neither.
+    return sandRelief(worldX, worldZ, steepness) + rockRelief(worldX, worldZ, steepness) * 0.35
+  }
+  return rockRelief(worldX, worldZ, steepness)
+}
+
+function rockRelief(worldX: number, worldZ: number, steepness: number): number {
   if (!detailField || props.detailRelief <= 0) return 0
   const dryness = waterProximity ? waterProximity(worldX, worldZ) : 1
   if (dryness <= 0) return 0
@@ -461,6 +624,13 @@ function buildTerrain(originX: number, originZ: number) {
   const amplitude = heightfield.amplitude || 1
 
   const isNatural = natural.value
+  const isDesert = desert.value
+  const wind = windVector.value
+  const sandDark = new THREE.Color(DESERT.sandShade)
+  const sandMid = new THREE.Color(DESERT.sand)
+  const sandBright = new THREE.Color(DESERT.sandLit)
+  const rockLight = new THREE.Color(DESERT.rock)
+  const rockDark = new THREE.Color(DESERT.rockDark)
   const lowland = new THREE.Color(NATURAL.lowland)
   const upland = new THREE.Color(NATURAL.upland)
   const dry = new THREE.Color(NATURAL.dry)
@@ -514,7 +684,32 @@ function buildTerrain(originX: number, originZ: number) {
     normals[i * 3 + 1] = n[1]
     normals[i * 3 + 2] = n[2]
 
-    if (isNatural) {
+    if (isDesert) {
+      // Sand takes its tone from which way the face is turned, not from
+      // altitude: crests catch the sun and bleach, hollows hold shadow. Rock
+      // shows only where the slope is too steep for sand to stay on it.
+      const slope = 1 - n[1]
+      const facing = n[0] * wind.x + n[2] * wind.z
+
+      mixA.copy(sandMid)
+      // Lee faces, turned away from the wind, sit in their own shade.
+      mixA.lerp(sandDark, Math.min(1, Math.max(0, facing * 1.5)))
+      mixA.lerp(sandBright, Math.min(1, Math.max(0, -facing * 1.3)))
+
+      const exposure = Math.min(1, Math.max(0, (slope - 0.22) * 2.8))
+      mixA.lerp(rockLight, exposure)
+      mixA.lerp(rockDark, Math.min(1, Math.max(0, (slope - 0.5) * 2.2)))
+
+      if (detailField) {
+        const grain = detailField.heightAt(wz * 2.7, wx * 2.7)
+        mixA.multiplyScalar(0.9 + grain * 0.2)
+      }
+
+      const occluded = 1 - cavity * 0.35
+      colors[i * 3] = mixA.r * occluded
+      colors[i * 3 + 1] = mixA.g * occluded
+      colors[i * 3 + 2] = mixA.b * occluded
+    } else if (isNatural) {
       // Ground cover by altitude, then rock wherever the face is too steep to
       // hold soil — which is what actually reads as a gorge wall.
       const t = Math.min(1, Math.max(0, h / amplitude))
@@ -1076,6 +1271,130 @@ function buildBoulderGeometry(seed: number): THREE.BufferGeometry {
   return faceted
 }
 
+/**
+ * Airborne dust and saltating sand.
+ *
+ * Wind is invisible; what you actually see is what it carries. The grains are
+ * points rather than geometry, recycled in the shader by wrapping their
+ * position through a moving box around the camera — so a fixed buffer looks
+ * like an endless stream, and nothing has to be simulated on the CPU.
+ */
+function buildDust() {
+  if (!scene) return
+
+  const count = 26000
+  const spanXZ = props.gridSize * 0.65
+  const spanY = 26
+  const positions = new Float32Array(count * 3)
+  const seeds = new Float32Array(count * 2)
+
+  for (let i = 0; i < count; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * spanXZ
+    // Height is an *offset above the ground*, resolved in the shader. Storing
+    // an absolute Y put the whole layer underground: the terrain here sits at
+    // 74-100 world units, and the dust was sitting at 0-26.
+    positions[i * 3 + 1] = Math.pow(Math.random(), 2.6) * spanY
+    positions[i * 3 + 2] = (Math.random() - 0.5) * spanXZ
+    seeds[i * 2] = Math.random()
+    seeds[i * 2 + 1] = 0.35 + Math.random() * 0.9
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 2))
+
+  const wind = windVector.value
+  dustMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+    uniforms: {
+      uTime: waterUniforms.uTime,
+      uWind: { value: new THREE.Vector2(wind.x, wind.z) },
+      uWindSpeed: { value: props.windSpeed },
+      uColor: { value: new THREE.Color(DESERT.dust) },
+      uOrigin: { value: new THREE.Vector3() },
+      uGroundY: { value: 0 },
+      uSpanXZ: { value: spanXZ },
+      uSpanY: { value: spanY },
+      uFogColor: { value: new THREE.Color(palette.value.fog) },
+      uFogNear: { value: 1 },
+      uFogFar: { value: props.gridSize },
+    },
+    vertexShader: `
+      attribute vec2 aSeed;
+      uniform float uTime;
+      uniform vec2 uWind;
+      uniform float uWindSpeed;
+      uniform vec3 uOrigin;
+      uniform float uGroundY;
+      uniform float uSpanXZ;
+      uniform float uSpanY;
+      varying float vFade;
+      varying float vDepth;
+
+      void main() {
+        vec3 p = position;
+        // Lift the layer onto the ground the camera is standing over.
+        p.y += uGroundY;
+
+        // Carry downwind, faster the higher it is — the ground drags on it.
+        float lift = clamp((p.y - uGroundY) / uSpanY, 0.0, 1.0);
+        float speed = uWindSpeed * (2.2 + lift * 7.0) * aSeed.y;
+        p.xz += uWind * (uTime * speed);
+
+        // A little bobbing so grains are not on rails.
+        p.y += sin(uTime * (0.7 + aSeed.x * 1.6) + aSeed.x * 40.0) * 0.35 * (0.3 + lift);
+        p.xz += vec2(
+          sin(uTime * 0.9 + aSeed.x * 30.0),
+          cos(uTime * 1.1 + aSeed.y * 22.0)
+        ) * 0.6;
+
+        // Wrap through a box that follows the camera, so a fixed number of
+        // grains reads as a continuous stream however long you watch.
+        vec2 rel = p.xz - uOrigin.xz;
+        rel = mod(rel + uSpanXZ * 0.5, uSpanXZ) - uSpanXZ * 0.5;
+        p.xz = uOrigin.xz + rel;
+
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        vDepth = -mv.z;
+
+        // Fade at the top of the layer and as grains recede, so nothing pops
+        // in or out at the wrap boundary.
+        float edge = 1.0 - smoothstep(0.55, 1.0, length(rel) / (uSpanXZ * 0.5));
+        vFade = edge * (1.0 - lift * 0.55);
+
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = (aSeed.y * 2.4 + 0.8) * (36.0 / max(vDepth, 1.0));
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColor;
+      uniform vec3 uFogColor;
+      uniform float uFogNear;
+      uniform float uFogFar;
+      varying float vFade;
+      varying float vDepth;
+
+      void main() {
+        // Round grains, soft at the edge.
+        vec2 d = gl_PointCoord - 0.5;
+        float r = dot(d, d);
+        if (r > 0.25) discard;
+        float alpha = (1.0 - smoothstep(0.05, 0.25, r)) * vFade * 0.5;
+        if (alpha < 0.01) discard;
+
+        float fog = smoothstep(uFogNear, uFogFar, vDepth);
+        gl_FragColor = vec4(mix(uColor, uFogColor, fog), alpha * (1.0 - fog * 0.85));
+      }
+    `,
+  })
+
+  dustPoints = new THREE.Points(geometry, dustMaterial)
+  dustPoints.frustumCulled = false
+  scene.add(dustPoints)
+}
+
 /** Deterministic per-cell noise, so a rebuild reproduces the same forest. */
 function cellHash(i: number): number {
   let h = Math.imul(i ^ 0x9e3779b9, 2654435761)
@@ -1373,6 +1692,12 @@ function loop(time: number) {
   waterUniforms.uTime.value += dt
 
   if (skyMesh) skyMesh.position.copy(camera.position)
+  if (dustMaterial && scene.fog instanceof THREE.Fog) {
+    dustMaterial.uniforms.uOrigin!.value.copy(camera.position)
+    dustMaterial.uniforms.uGroundY!.value = camera.position.y - props.altitude - rig.altitudeTrim
+    dustMaterial.uniforms.uFogNear!.value = scene.fog.near
+    dustMaterial.uniforms.uFogFar!.value = scene.fog.far
+  }
   if (sunLight?.castShadow) {
     const sun = waterUniforms.uSun.value
     const distance = props.gridSize * 0.55
@@ -1500,6 +1825,12 @@ function resize() {
 }
 
 let initialising = false
+/**
+ * Set once the component unmounts. `init` awaits a network fetch, so a remount
+ * during that await would otherwise leave the old instance to finish building
+ * a scene nobody can see — burning a WebGL context and a render loop on it.
+ */
+let disposed = false
 
 async function init() {
   if (initialising) return
@@ -1547,7 +1878,7 @@ async function init() {
 
   // The component may have unmounted while the terrain was in flight.
   const el = container.value
-  if (!el) {
+  if (!el || disposed) {
     initialising = false
     return
   }
@@ -1630,8 +1961,8 @@ async function init() {
       depthWrite: false,
       fog: false,
       uniforms: {
-        uHorizon: { value: new THREE.Color(NATURAL.skyHorizon) },
-        uZenith: { value: new THREE.Color(NATURAL.skyZenith) },
+        uHorizon: { value: new THREE.Color(desert.value ? DESERT.skyHorizon : NATURAL.skyHorizon) },
+        uZenith: { value: new THREE.Color(desert.value ? DESERT.skyZenith : NATURAL.skyZenith) },
         uSun: waterUniforms.uSun,
       },
       vertexShader: `
@@ -1685,6 +2016,76 @@ async function init() {
     wireframe: natural.value ? false : props.wireframe,
   })
 
+  if (desert.value) {
+    // Ripples finer than the mesh spacing live here rather than in geometry:
+    // at ~0.7m between vertices, anything under a couple of metres would alias
+    // into noise if it were displaced. Perturbing the normal instead gives the
+    // surface texture at any distance, and lets the sheets that drift over it
+    // move without touching the mesh.
+    const wind = windVector.value
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = waterUniforms.uTime
+      shader.uniforms.uWind = { value: new THREE.Vector2(wind.x, wind.z) }
+      shader.uniforms.uWindSpeed = { value: props.windSpeed }
+
+      shader.vertexShader =
+        'varying vec3 vSandWorld;\n' +
+        shader.vertexShader.replace(
+          '#include <begin_vertex>',
+          '#include <begin_vertex>\nvSandWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;',
+        )
+
+      shader.fragmentShader =
+        [
+          'uniform float uTime;',
+          'uniform vec2 uWind;',
+          'uniform float uWindSpeed;',
+          'varying vec3 vSandWorld;',
+          'float sandHash(vec2 p) {',
+          '  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);',
+          '}',
+          'float sandNoise(vec2 p) {',
+          '  vec2 i = floor(p), f = fract(p);',
+          '  f = f * f * (3.0 - 2.0 * f);',
+          '  return mix(mix(sandHash(i), sandHash(i + vec2(1.0, 0.0)), f.x),',
+          '             mix(sandHash(i + vec2(0.0, 1.0)), sandHash(i + vec2(1.0, 1.0)), f.x), f.y);',
+          '}',
+        ].join('\n') +
+        '\n' +
+        shader.fragmentShader.replace(
+          '#include <opaque_fragment>',
+          [
+            'vec2 wp = vSandWorld.xz;',
+            'float alongW = dot(wp, uWind);',
+            'float acrossW = dot(wp, vec2(-uWind.y, uWind.x));',
+            // Two ripple scales below the mesh resolution, bent by noise so
+            // they are never perfectly parallel.
+            'float bend = sandNoise(wp * 0.05) * 2.0 - 1.0;',
+            'float bend2 = sandNoise(wp * 0.19) * 2.0 - 1.0;',
+            'float rip1 = sin((alongW * 2.9) + bend * 1.6 + bend2 * 0.7);',
+            'float rip2 = sin((alongW * 8.5) - bend * 1.1 + acrossW * 0.09 + bend2 * 0.9);',
+            // Vary how pronounced the train is along its length, without ever
+            // erasing it — a mask that reaches zero leaves bald sand. Not named
+            // `patch`: that is a reserved word in GLSL, and using it fails the
+            // whole fragment shader, which renders the terrain not at all.
+            'float rippleMask = mix(0.5, 1.0, smoothstep(0.25, 0.8, sandNoise(wp * 0.035)));',
+            'float rippleShade = (rip1 * 0.6 + rip2 * 0.26) * rippleMask;',
+            // Light them directionally: the windward side of each crest catches
+            // sun, the lee side falls away.
+            'float lit = clamp(0.5 + rippleShade * 0.5, 0.0, 1.0);',
+            'outgoingLight *= mix(0.74, 1.22, lit);',
+            // Sheets of loose sand streaming downwind over the surface. They
+            // move, the ground does not.
+            'float streamPhase = alongW * 0.32 - uTime * 2.6 * uWindSpeed;',
+            'float sheet = sandNoise(vec2(streamPhase * 0.5, acrossW * 0.08 + sandNoise(wp * 0.02) * 3.0));',
+            'float streak = smoothstep(0.62, 0.96, sheet) * uWindSpeed;',
+            'outgoingLight = mix(outgoingLight, outgoingLight * 1.35 + vec3(0.06, 0.05, 0.035), streak * 0.75);',
+            '#include <opaque_fragment>',
+          ].join('\n'),
+        )
+    }
+  }
+
   mesh = new THREE.Mesh(geometry, material)
   // Heights change constantly, so a stale bounding sphere would cull wrongly.
   mesh.frustumCulled = false
@@ -1697,8 +2098,9 @@ async function init() {
   scene.add(mesh)
 
   hemiLight = new THREE.HemisphereLight(
-    natural.value ? 0xa8c4dc : 0x93a7b3,
-    natural.value ? 0x3d4436 : 0x10161a,
+    desert.value ? 0xdcc9a8 : natural.value ? 0xa8c4dc : 0x93a7b3,
+    // Sand bounces a lot of light back up; soil and leaf litter do not.
+    desert.value ? 0x8a7050 : natural.value ? 0x3d4436 : 0x10161a,
     palette.value.ambient,
   )
   scene.add(hemiLight)
@@ -1706,10 +2108,15 @@ async function init() {
   // is what separates them from each other at distance. Kept above 45° so that
   // flat lowland still catches enough light to read when the seed lands there.
   sunLight = new THREE.DirectionalLight(
-    natural.value ? new THREE.Color(NATURAL.sunColor) : 0xffe4c4,
+    desert.value
+      ? new THREE.Color(DESERT.sunColor)
+      : natural.value
+        ? new THREE.Color(NATURAL.sunColor)
+        : 0xffe4c4,
     palette.value.sun,
   )
-  sunLight.position.set(-0.6, 0.75, 0.45)
+  waterUniforms.uSun.value.copy(sunDirection.value)
+  sunLight.position.copy(sunDirection.value)
   scene.add(sunLight)
 
   if (natural.value) {
@@ -1731,6 +2138,8 @@ async function init() {
     sunLight.shadow.normalBias = 0.6
     scene.add(sunLight.target)
   }
+
+  if (desert.value) buildDust()
 
   if (pendingFeatures && heightfield instanceof DemHeightfield) {
     buildFeatures(pendingFeatures, pendingFlow, heightfield, pendingFeatureRes, pendingFlowRes)
@@ -1769,10 +2178,19 @@ async function init() {
   document.addEventListener('visibilitychange', onVisibilityChange)
 
   if (import.meta.dev) {
-    ;(window as unknown as Record<string, unknown>).__terrain = {
-      scene, mesh, material, waterMesh, treeMesh, heightfield, detailField, camera,
+    // Attached to the element rather than to window: several instances can be
+    // alive briefly across a remount, and a global would report whichever
+    // finished last rather than the one actually on screen.
+    ;(el as unknown as Record<string, unknown>).__terrain = {
+      scene, mesh, material, waterMesh, treeMesh, heightfield, detailField, camera, renderer, rig,
+      get state() { return { hasHeightfield: !!heightfield, hasCamera: !!camera, visible, documentVisible, frameHandle } },
     }
   }
+
+  // Place the camera now rather than waiting for the first frame. The rig is
+  // only applied inside the loop, so until one runs the camera sits at the
+  // origin — which here is 75m underground, and renders as nothing but sky.
+  updateCamera(0)
 
   frameHandle = requestAnimationFrame(loop)
   initialising = false
@@ -1790,6 +2208,7 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  disposed = true
   cancelAnimationFrame(frameHandle)
   resizeObserver?.disconnect()
   intersectionObserver?.disconnect()
@@ -1812,6 +2231,8 @@ onBeforeUnmount(() => {
   rockMaterial?.dispose()
   skyMesh?.geometry.dispose()
   ;(skyMesh?.material as THREE.Material | undefined)?.dispose()
+  dustPoints?.geometry.dispose()
+  dustMaterial?.dispose()
   renderer?.dispose()
   if (renderer?.domElement.parentNode) {
     renderer.domElement.parentNode.removeChild(renderer.domElement)
@@ -1835,6 +2256,8 @@ onBeforeUnmount(() => {
   rockMesh = null
   rockMaterial = null
   skyMesh = null
+  dustPoints = null
+  dustMaterial = null
   waterProximity = null
   detailField = null
   forestCells = null
